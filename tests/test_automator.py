@@ -34,6 +34,38 @@ def test_parse_proxy_json_success():
     assert files[0].isdir is False
 
 
+def test_parse_proxy_json_direct_link():
+    sample_json = {
+        "errno": 0,
+        "list": [
+            {
+                "fs_id": 1062221837712075,
+                "server_filename": "2B9131FD6E605560-00-00.mrimg.000.enc",
+                "size": 4290773051,
+                "formatted_size": "4.00 GB",
+                "direct_link": "https://dl-worker.teraboxdl.site?token=test_token_1",
+                "isdir": 0,
+            },
+            {
+                "fs_id": 972772508297927,
+                "server_filename": "2B9131FD6E605560-00-00.mrimg.001.enc",
+                "size": 4290773051,
+                "formatted_size": "4.00 GB",
+                "direct_link": "https://dl-worker.teraboxdl.site?token=test_token_2",
+                "isdir": 0,
+            },
+        ],
+    }
+
+    files = parse_proxy_json(sample_json)
+    assert len(files) == 2
+    assert files[0].filename == "2B9131FD6E605560-00-00.mrimg.000.enc"
+    assert files[0].download_url == "https://dl-worker.teraboxdl.site?token=test_token_1"
+    assert files[0].size_bytes == 4290773051
+    assert files[1].filename == "2B9131FD6E605560-00-00.mrimg.001.enc"
+    assert files[1].download_url == "https://dl-worker.teraboxdl.site?token=test_token_2"
+
+
 def test_parse_proxy_json_error():
     err_json = {
         "errno": 140,

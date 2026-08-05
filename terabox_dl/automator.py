@@ -35,7 +35,6 @@ IGNORE_DOMAINS = {
     "diskwala.com",
     "teraboxapi.com",
     "viral.teraboxdl.site",
-    "teraboxdl.site",
     "t.me",
     "telegram.me",
     "discord.gg",
@@ -67,7 +66,7 @@ def parse_proxy_json(json_data: Dict[str, Any]) -> List[FileInfo]:
     elif not isinstance(items, list):
         items = []
 
-    if not items and ("dlink" in json_data or "download_url" in json_data):
+    if not items and ("dlink" in json_data or "download_url" in json_data or "direct_link" in json_data):
         items = [json_data]
 
     for item in items:
@@ -82,10 +81,12 @@ def parse_proxy_json(json_data: Dict[str, Any]) -> List[FileInfo]:
             or "unnamed_file"
         )
         download_url = (
-            item.get("fast_download_url")
+            item.get("direct_link")
+            or item.get("fast_download_url")
             or item.get("dlink")
             or item.get("download_url")
             or item.get("url")
+            or item.get("link")
             or ""
         )
         size_raw = item.get("size") or item.get("size_bytes") or 0
@@ -138,7 +139,10 @@ def parse_dom_files(html: str) -> List[FileInfo]:
         ):
             continue
 
-        is_dl_domain = any(x in domain for x in ["d.1024teradl", "fast.1024teradl", "dl.terabox", "dlink", "terafile"])
+        is_dl_domain = any(
+            x in domain
+            for x in ["d.1024teradl", "fast.1024teradl", "dl.terabox", "dlink", "terafile", "dl-worker", "teraboxdl"]
+        )
         has_file_ext = any(href.lower().split("?")[0].endswith(ext) for ext in FILE_EXTENSIONS)
 
         if not (is_dl_domain or has_file_ext or "dlink=" in href.lower()):
