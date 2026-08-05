@@ -1,0 +1,21 @@
+# Environments
+.venv/
+venv/
+env/
+
+# Python cache & distribution
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# Downloads directory and temporary part files
+downloads/
+*.part
+*.tmp
+
+# OS files
+.DS_Store

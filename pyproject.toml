@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "terabox-downloader"
+version = "0.1.0"
+description = "Automated concurrent resumable file downloader for TeraBox links using 1024teradl.com and browser automation"
+authors = [
+    { name = "Antigravity AI", email = "ai@example.com" }
+]
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "nodriver>=0.50.3",
+    "playwright>=1.62.0",
+    "playwright-stealth>=2.0.3",
+    "httpx>=0.28.1",
+    "rich>=15.0.0",
+    "aiofiles>=25.1.0",
+    "typer>=0.27.1",
+    "beautifulsoup4>=4.15.0",
+    "lxml>=6.1.1",
+    "curl_cffi>=0.16.0",
+]
+
+[project.scripts]
+terabox-dl = "terabox_dl.cli:app"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
