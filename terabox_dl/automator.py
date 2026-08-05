@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import os
 import re
 from typing import Any, Dict, List, Optional, Set
 from urllib.parse import urlparse
@@ -228,12 +229,14 @@ class TeraBoxAutomator:
             }
             if self.config.chrome_executable_path:
                 start_kwargs["browser_executable_path"] = self.config.chrome_executable_path
+            if hasattr(os, "geteuid") and os.geteuid() == 0:
+                start_kwargs["no_sandbox"] = True
 
             browser = await uc.start(**start_kwargs)
             page = await browser.get("https://1024teradl.com/")
 
             # Wait for Cloudflare Turnstile challenge if present
-            for _ in range(20):
+            for _ in range(30):
                 await asyncio.sleep(1)
                 title = await page.evaluate("document.title")
                 if title and "Just a moment" not in title and "Cloudflare" not in title:
@@ -338,13 +341,25 @@ class TeraBoxAutomator:
         api_error_message: Optional[str] = None
 
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=self.config.headless)
+            args = [
+                "--disable-blink-features=AutomationControlled",
+                "--disable-infobars",
+                "--window-size=1920,1080",
+            ]
+            if hasattr(os, "geteuid") and os.geteuid() == 0:
+                args.append("--no-sandbox")
+
+            browser = await p.chromium.launch(
+                headless=self.config.headless,
+                args=args,
+            )
             context = await browser.new_context(
+                viewport={"width": 1920, "height": 1080},
                 user_agent=(
                     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
                     "Chrome/151.0.0.0 Safari/537.36"
-                )
+                ),
             )
             page = await context.new_page()
             await _apply_stealth(page)
@@ -365,7 +380,32 @@ class TeraBoxAutomator:
                         pass
 
             page.on("response", handle_response)
-            await page.goto("https://1024teradl.com/", wait_until="networkidle")
+            await page.goto("https://1024teradl.com/", wait_until="domcontentloaded", timeout=60000)
+
+            # Wait for Cloudflare Turnstile challenge to resolve and input box to appear
+            for _ in range(30):
+                title = await page.title()
+                if title and "Just a moment" not in title and "Cloudflare" not in title:
+                    try:
+                        inp = await page.wait_for_selector(
+                            "input[placeholder*='Terabox'], input", timeout=1000
+                        )
+                        if inp:
+                            break
+                    except Exception:
+                        pass
+                for frame in page.frames:
+                    if "cloudflare" in frame.url or "turnstile" in frame.url:
+                        try:
+                            checkbox = await frame.wait_for_selector(
+                                "input[type='checkbox'], .cb-lb, #challenge-stage",
+                                timeout=500,
+                            )
+                            if checkbox:
+                                await checkbox.click()
+                        except Exception:
+                            pass
+                await asyncio.sleep(1)
 
             await page.fill("input[placeholder*='Terabox']", terabox_url)
             await page.click("button[type='submit']")
