@@ -35,7 +35,7 @@ An automated, concurrent, and resumable file downloader for TeraBox shared links
 ### Install from Source
 1. Clone the repository and create a virtual environment:
    ```bash
-   git clone https://github.com/example/terabox_downloader.git
+   git clone https://github.com/moandor-y/terabox_downloader.git
    cd terabox_downloader
    python3 -m venv .venv
    source .venv/bin/activate

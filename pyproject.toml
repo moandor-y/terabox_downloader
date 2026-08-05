@@ -24,6 +24,10 @@ dependencies = [
     "curl_cffi>=0.16.0",
 ]
 
+[project.urls]
+Homepage = "https://github.com/moandor-y/terabox_downloader"
+Repository = "https://github.com/moandor-y/terabox_downloader"
+
 [project.scripts]
 terabox-dl = "terabox_dl.cli:app"
 
