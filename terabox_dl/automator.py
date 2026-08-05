@@ -323,7 +323,12 @@ class TeraBoxAutomator:
         """Extract files using Playwright with stealth (if available in environment)."""
         try:
             from playwright.async_api import async_playwright
-            from playwright_stealth import stealth_async
+            try:
+                from playwright_stealth import Stealth
+                async def _apply_stealth(page):
+                    await Stealth().apply_stealth_async(page)
+            except ImportError:
+                from playwright_stealth import stealth_async as _apply_stealth
         except ImportError as exc:
             raise RuntimeError(
                 "Playwright or playwright-stealth is not installed or available."
@@ -342,7 +347,7 @@ class TeraBoxAutomator:
                 )
             )
             page = await context.new_page()
-            await stealth_async(page)
+            await _apply_stealth(page)
 
             async def handle_response(response):
                 nonlocal api_error_message
