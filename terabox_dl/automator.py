@@ -241,6 +241,14 @@ class TeraBoxAutomator:
                 title = await page.evaluate("document.title")
                 if title and "Just a moment" not in title and "Cloudflare" not in title:
                     break
+                try:
+                    iframe = await page.select(
+                        "iframe[src*='cloudflare'], iframe[src*='turnstile'], iframe[title*='Cloudflare'], iframe[title*='challenge']"
+                    )
+                    if iframe:
+                        await iframe.mouse_click()
+                except Exception:
+                    pass
 
             # Enable CDP network domain after navigation finishes
             await page.send(uc.cdp.network.enable())
@@ -349,17 +357,28 @@ class TeraBoxAutomator:
             if hasattr(os, "geteuid") and os.geteuid() == 0:
                 args.append("--no-sandbox")
 
-            browser = await p.chromium.launch(
-                headless=self.config.headless,
-                args=args,
-            )
+            launch_kwargs = {
+                "headless": self.config.headless,
+                "args": args,
+            }
+            if self.config.chrome_executable_path and os.path.exists(
+                self.config.chrome_executable_path
+            ):
+                launch_kwargs["executable_path"] = self.config.chrome_executable_path
+            else:
+                try:
+                    launch_kwargs["channel"] = "chrome"
+                except Exception:
+                    pass
+
+            try:
+                browser = await p.chromium.launch(**launch_kwargs)
+            except Exception:
+                launch_kwargs.pop("channel", None)
+                browser = await p.chromium.launch(**launch_kwargs)
+
             context = await browser.new_context(
                 viewport={"width": 1920, "height": 1080},
-                user_agent=(
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/151.0.0.0 Safari/537.36"
-                ),
             )
             page = await context.new_page()
             await _apply_stealth(page)
@@ -394,6 +413,24 @@ class TeraBoxAutomator:
                             break
                     except Exception:
                         pass
+                try:
+                    for iframe_sel in [
+                        "iframe[src*='cloudflare']",
+                        "iframe[src*='turnstile']",
+                        "iframe[title*='Cloudflare']",
+                        "iframe[title*='challenge']",
+                    ]:
+                        el = await page.query_selector(iframe_sel)
+                        if el:
+                            box = await el.bounding_box()
+                            if box and box["width"] > 0 and box["height"] > 0:
+                                await page.mouse.click(
+                                    box["x"] + box["width"] / 2,
+                                    box["y"] + box["height"] / 2,
+                                )
+                            break
+                except Exception:
+                    pass
                 for frame in page.frames:
                     if "cloudflare" in frame.url or "turnstile" in frame.url:
                         try:
