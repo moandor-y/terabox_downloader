@@ -19,3 +19,6 @@ downloads/
 
 # OS files
 .DS_Store
+
+# Version control
+.jj/
