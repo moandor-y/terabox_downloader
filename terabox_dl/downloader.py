@@ -231,11 +231,22 @@ class AsyncDownloader:
         semaphore = asyncio.Semaphore(self.config.concurrency)
         results: List[DownloadResult] = []
 
+        class BinaryTransferSpeedColumn(TransferSpeedColumn):
+            def render(self, task) -> "Text":
+                speed = task.finished_speed or task.speed
+                if speed is None:
+                    from rich.text import Text
+                    return Text("?", style="progress.data.speed")
+                from terabox_dl.utils import format_bytes
+                from rich.text import Text
+                data_speed = format_bytes(int(speed))
+                return Text(f"{data_speed}/s", style="progress.data.speed")
+
         progress = Progress(
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
-            DownloadColumn(),
-            TransferSpeedColumn(),
+            DownloadColumn(binary_units=True),
+            BinaryTransferSpeedColumn(),
             TimeRemainingColumn(),
             console=console,
         )

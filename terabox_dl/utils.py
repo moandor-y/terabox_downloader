@@ -90,7 +90,7 @@ def format_bytes(size: int) -> str:
     """Format an integer byte count into human-readable string representation."""
     if size <= 0:
         return "0 B"
-    units = ["B", "KB", "MB", "GB", "TB"]
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
     unit_idx = 0
     val = float(size)
     while val >= 1024.0 and unit_idx < len(units) - 1:
