@@ -34,6 +34,12 @@ def setup_logging(verbose: bool):
         datefmt="[%X]",
         handlers=[RichHandler(console=console, rich_tracebacks=True, show_path=verbose)],
     )
+    
+    # Silence third-party noise that corrupts the progress bar
+    if not verbose:
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("httpcore").setLevel(logging.WARNING)
+        logging.getLogger("nodriver").setLevel(logging.WARNING)
 
 
 def print_files_table(files: List[FileInfo]):
