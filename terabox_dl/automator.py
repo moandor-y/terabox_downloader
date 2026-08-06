@@ -44,6 +44,29 @@ IGNORE_DOMAINS = {
     "reddit.com",
 }
 
+AD_BLOCKED_PATTERNS = [
+    "*googlesyndication*",
+    "*doubleclick.net*",
+    "*adservice*",
+    "*adsterra*",
+    "*monetag*",
+    "*popcash*",
+    "*popads*",
+    "*adnxs*",
+    "*adtrue*",
+    "*propellerads*",
+    "*onclickalgo*",
+    "*clksite*",
+    "*vignette*",
+    "*adkeeper*",
+    "*highperformanceformat*",
+    "*effectivegate*",
+    "*alwingulla*",
+    "*deloton*",
+    "*syndication*",
+    "*creative.revcontent.com*",
+]
+
 
 def parse_proxy_json(json_data: Dict[str, Any]) -> List[FileInfo]:
     """Parse JSON response from 1024teradl.com /api/proxy into FileInfo objects."""
@@ -250,8 +273,12 @@ class TeraBoxAutomator:
                 except Exception:
                     pass
 
-            # Enable CDP network domain after navigation finishes
+            # Enable CDP network domain and block ad networks
             await page.send(uc.cdp.network.enable())
+            try:
+                await page.send(uc.cdp.network.set_blocked_ur_ls(urls=AD_BLOCKED_PATTERNS))
+            except Exception:
+                pass
 
             async def on_response(event: uc.cdp.network.ResponseReceived):
                 url = event.response.url
@@ -282,30 +309,149 @@ class TeraBoxAutomator:
             page.add_handler(uc.cdp.network.ResponseReceived, on_response)
             page.add_handler(uc.cdp.network.LoadingFinished, on_loading_finished)
 
-            # Find and fill the URL input
-            inp = await page.select("input[placeholder*='Terabox']")
-            if not inp:
-                inp = await page.select("input")
-            if not inp:
-                raise RuntimeError("Could not find TeraBox URL input box on 1024teradl.com")
+            # Direct In-Page Multi-Page Extraction (100% immune to UI ad blockers, overlays, modals, and popunders)
+            direct_fetch_script = f"""
+            (async () => {{
+                const teraboxUrl = {json.dumps(terabox_url)};
+                const allBatches = [];
+                let curPage = 1;
+                let hasMore = true;
+                let shareId = null;
+                let uk = null;
+                
+                while (hasMore && curPage <= 50) {{
+                    const payload = {{ url: teraboxUrl, page: curPage }};
+                    if (shareId && uk) {{
+                        payload.share_id = shareId;
+                        payload.uk = uk;
+                        payload.dir = '';
+                    }}
+                    
+                    try {{
+                        const r = await fetch('/api/proxy', {{
+                            method: 'POST',
+                            headers: {{ 'Content-Type': 'application/json' }},
+                            body: JSON.stringify(payload)
+                        }});
+                        if (!r.ok) break;
+                        const data = await r.json();
+                        if (data.errno && data.errno !== 0) {{
+                            return JSON.stringify({{ error: data.errmsg || data.msg || ('Error ' + data.errno) }});
+                        }}
+                        allBatches.push(data);
+                        shareId = data.share_id || shareId;
+                        uk = data.uk || uk;
+                        hasMore = Boolean(data.has_more);
+                        curPage = data.next_page || (curPage + 1);
+                        if (!data.list || data.list.length === 0) break;
+                    }} catch(e) {{
+                        break;
+                    }}
+                }}
+                return JSON.stringify({{ batches: allBatches }});
+            }})()
+            """
+            try:
+                fetch_res_raw = await page.evaluate(direct_fetch_script, await_promise=True)
+                if isinstance(fetch_res_raw, str):
+                    fetch_res = json.loads(fetch_res_raw)
+                    if "error" in fetch_res:
+                        api_error_message = fetch_res["error"]
+                    elif "batches" in fetch_res:
+                        for b in fetch_res["batches"]:
+                            parsed = parse_proxy_json(b)
+                            captured_files.extend(parsed)
+            except Exception as e:
+                logger.debug("Direct in-page fetch fallback: %s", e)
 
-            await inp.mouse_click()
-            await asyncio.sleep(0.3)
-            await inp.send_keys(terabox_url)
-            await asyncio.sleep(0.3)
+            # If not captured via direct fetch, fall back to UI form submission
+            if not captured_files and not api_error_message:
+                # Block popunder/popup ads and clean ad overlay backdrops
+                cleanup_script = """
+                (() => {
+                    window.open = function() { return null; };
+                    const adSelectors = [
+                        'ins.adsbygoogle',
+                        '[id*="google_ads"]',
+                        '[id*="aswift"]',
+                        'iframe[src*="ad"]',
+                        'iframe[id*="ad"]',
+                        '[class*="ad-"]',
+                        '[class*="ads-"]',
+                        '[class*="ad_"]',
+                        '[id*="pop"]',
+                        '[class*="popup"]',
+                        '[class*="overlay"]',
+                        '[class*="modal"]',
+                        '.ad-container',
+                        '.ads-wrapper',
+                    ];
+                    for (const sel of adSelectors) {
+                        document.querySelectorAll(sel).forEach(el => {
+                            if (!el.querySelector('input') && !el.querySelector('iframe[src*="turnstile"]') && !el.querySelector('iframe[src*="cloudflare"]')) {
+                                el.remove();
+                            }
+                        });
+                    }
+                    document.querySelectorAll('div, section, aside, span, a').forEach(el => {
+                        const style = window.getComputedStyle(el);
+                        if ((style.position === 'fixed' || style.position === 'absolute') && parseInt(style.zIndex, 10) >= 100) {
+                            if (!el.querySelector('input') && !el.querySelector('iframe[src*="turnstile"]') && !el.querySelector('iframe[src*="cloudflare"]') && !el.querySelector('button[type="submit"]')) {
+                                el.remove();
+                            }
+                        }
+                    });
+                })()
+                """
+                try:
+                    await page.evaluate(cleanup_script)
+                except Exception:
+                    pass
 
-            # Click download button
-            btn = await page.select("button[type='submit']")
-            if not btn:
-                raise RuntimeError("Could not find Download submit button on 1024teradl.com")
+                # Fill input and submit using robust JavaScript event dispatching
+                submit_script = f"""
+                (() => {{
+                    const targetUrl = {json.dumps(terabox_url)};
+                    const inp = document.querySelector('input[placeholder*="Terabox"]') ||
+                              document.querySelector('input[type="text"]') ||
+                              document.querySelector('input[type="url"]') ||
+                              document.querySelector('input:not([type="hidden"])');
+                    if (inp) {{
+                        const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+                        nativeSetter.call(inp, targetUrl);
+                        inp.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                        inp.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                    }}
+                    const btn = document.querySelector('button[type="submit"]') ||
+                                document.querySelector('form button') ||
+                                document.querySelector('button');
+                    if (btn) {{
+                        btn.click();
+                    }}
+                    const form = document.querySelector('form');
+                    if (form) {{
+                        form.dispatchEvent(new Event('submit', {{ bubbles: true, cancelable: true }}));
+                    }}
+                }})()
+                """
+                try:
+                    await page.evaluate(submit_script)
+                except Exception:
+                    pass
 
-            await btn.mouse_click()
+                # Fallback direct element click
+                try:
+                    btn = await page.select("button[type='submit']")
+                    if btn:
+                        await btn.mouse_click()
+                except Exception:
+                    pass
 
-            # Wait for response or DOM update
-            for _ in range(15):
-                await asyncio.sleep(1)
-                if captured_files or api_error_message:
-                    break
+                # Wait for initial response or DOM update
+                for _ in range(15):
+                    await asyncio.sleep(1)
+                    if captured_files or api_error_message:
+                        break
 
             if api_error_message:
                 raise RuntimeError(api_error_message)
@@ -444,13 +590,147 @@ class TeraBoxAutomator:
                             pass
                 await asyncio.sleep(1)
 
-            await page.fill("input[placeholder*='Terabox']", terabox_url)
-            await page.click("button[type='submit']")
+            # Direct In-Page Multi-Page Extraction (100% immune to UI ad blockers, overlays, modals, and popunders)
+            direct_fetch_script = f"""
+            (async () => {{
+                const teraboxUrl = {json.dumps(terabox_url)};
+                const allBatches = [];
+                let curPage = 1;
+                let hasMore = true;
+                let shareId = null;
+                let uk = null;
+                
+                while (hasMore && curPage <= 50) {{
+                    const payload = {{ url: teraboxUrl, page: curPage }};
+                    if (shareId && uk) {{
+                        payload.share_id = shareId;
+                        payload.uk = uk;
+                        payload.dir = '';
+                    }}
+                    
+                    try {{
+                        const r = await fetch('/api/proxy', {{
+                            method: 'POST',
+                            headers: {{ 'Content-Type': 'application/json' }},
+                            body: JSON.stringify(payload)
+                        }});
+                        if (!r.ok) break;
+                        const data = await r.json();
+                        if (data.errno && data.errno !== 0) {{
+                            return JSON.stringify({{ error: data.errmsg || data.msg || ('Error ' + data.errno) }});
+                        }}
+                        allBatches.push(data);
+                        shareId = data.share_id || shareId;
+                        uk = data.uk || uk;
+                        hasMore = Boolean(data.has_more);
+                        curPage = data.next_page || (curPage + 1);
+                        if (!data.list || data.list.length === 0) break;
+                    }} catch(e) {{
+                        break;
+                    }}
+                }}
+                return JSON.stringify({{ batches: allBatches }});
+            }})()
+            """
+            try:
+                fetch_res_raw = await page.evaluate(direct_fetch_script)
+                if isinstance(fetch_res_raw, str):
+                    fetch_res = json.loads(fetch_res_raw)
+                    if "error" in fetch_res:
+                        api_error_message = fetch_res["error"]
+                    elif "batches" in fetch_res:
+                        for b in fetch_res["batches"]:
+                            parsed = parse_proxy_json(b)
+                            captured_files.extend(parsed)
+            except Exception as e:
+                logger.debug("Playwright in-page fetch fallback: %s", e)
 
-            for _ in range(15):
-                await asyncio.sleep(1)
-                if captured_files or api_error_message:
-                    break
+            # If not captured via direct fetch, fall back to UI form submission
+            if not captured_files and not api_error_message:
+                # Block popunder/popup ads and clean ad overlay backdrops
+                cleanup_script = """
+                (() => {
+                    window.open = function() { return null; };
+                    const adSelectors = [
+                        'ins.adsbygoogle',
+                        '[id*="google_ads"]',
+                        '[id*="aswift"]',
+                        'iframe[src*="ad"]',
+                        'iframe[id*="ad"]',
+                        '[class*="ad-"]',
+                        '[class*="ads-"]',
+                        '[class*="ad_"]',
+                        '[id*="pop"]',
+                        '[class*="popup"]',
+                        '[class*="overlay"]',
+                        '[class*="modal"]',
+                        '.ad-container',
+                        '.ads-wrapper',
+                    ];
+                    for (const sel of adSelectors) {
+                        document.querySelectorAll(sel).forEach(el => {
+                            if (!el.querySelector('input') && !el.querySelector('iframe[src*="turnstile"]') && !el.querySelector('iframe[src*="cloudflare"]')) {
+                                el.remove();
+                            }
+                        });
+                    }
+                    document.querySelectorAll('div, section, aside, span, a').forEach(el => {
+                        const style = window.getComputedStyle(el);
+                        if ((style.position === 'fixed' || style.position === 'absolute') && parseInt(style.zIndex, 10) >= 100) {
+                            if (!el.querySelector('input') && !el.querySelector('iframe[src*="turnstile"]') && !el.querySelector('iframe[src*="cloudflare"]') && !el.querySelector('button[type="submit"]')) {
+                                el.remove();
+                            }
+                        }
+                    });
+                })()
+                """
+                try:
+                    await page.evaluate(cleanup_script)
+                except Exception:
+                    pass
+
+                # Fill input and submit using robust JavaScript event dispatching
+                submit_script = f"""
+                (() => {{
+                    const targetUrl = {json.dumps(terabox_url)};
+                    const inp = document.querySelector('input[placeholder*="Terabox"]') ||
+                              document.querySelector('input[type="text"]') ||
+                              document.querySelector('input[type="url"]') ||
+                              document.querySelector('input:not([type="hidden"])');
+                    if (inp) {{
+                        const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+                        nativeSetter.call(inp, targetUrl);
+                        inp.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                        inp.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                    }}
+                    const btn = document.querySelector('button[type="submit"]') ||
+                                document.querySelector('form button') ||
+                                document.querySelector('button');
+                    if (btn) {{
+                        btn.click();
+                    }}
+                    const form = document.querySelector('form');
+                    if (form) {{
+                        form.dispatchEvent(new Event('submit', {{ bubbles: true, cancelable: true }}));
+                    }}
+                }})()
+                """
+                try:
+                    await page.evaluate(submit_script)
+                except Exception:
+                    pass
+
+                try:
+                    await page.fill("input[placeholder*='Terabox']", terabox_url)
+                    await page.click("button[type='submit']")
+                except Exception:
+                    pass
+
+                # Wait for initial response or DOM update
+                for _ in range(15):
+                    await asyncio.sleep(1)
+                    if captured_files or api_error_message:
+                        break
 
             if api_error_message:
                 raise RuntimeError(api_error_message)

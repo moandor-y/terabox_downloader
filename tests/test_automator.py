@@ -116,3 +116,41 @@ async def test_extract_files_invalid_url():
     automator = TeraBoxAutomator()
     with pytest.raises(ValueError, match="Invalid TeraBox shared link"):
         await automator.extract_files("https://google.com/not_a_terabox_link")
+
+
+def test_parse_proxy_json_multi_page():
+    page1_json = {
+        "errno": 0,
+        "list": [
+            {
+                "fs_id": f"100{i}",
+                "server_filename": f"part_{i}.bin",
+                "size": 1024,
+                "isdir": 0,
+                "dlink": f"https://d.1024teradl.com/download/part_{i}.bin",
+            }
+            for i in range(20)
+        ],
+    }
+    page2_json = {
+        "errno": 0,
+        "list": [
+            {
+                "fs_id": f"200{i}",
+                "server_filename": f"part_{i+20}.bin",
+                "size": 1024,
+                "isdir": 0,
+                "dlink": f"https://d.1024teradl.com/download/part_{i+20}.bin",
+            }
+            for i in range(20)
+        ],
+    }
+
+    files1 = parse_proxy_json(page1_json)
+    files2 = parse_proxy_json(page2_json)
+    all_files = files1 + files2
+
+    assert len(all_files) == 40
+    assert all_files[0].filename == "part_0.bin"
+    assert all_files[39].filename == "part_39.bin"
+
