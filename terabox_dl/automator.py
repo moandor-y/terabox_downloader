@@ -230,8 +230,15 @@ class TeraBoxAutomator:
 
         if self.config.browser_engine == "playwright":
             return await self._extract_files_playwright(terabox_url)
-        else:
+        elif self.config.browser_engine == "nodriver":
             return await self._extract_files_nodriver(terabox_url)
+        else:
+            # engine == "auto"
+            try:
+                return await self._extract_files_nodriver(terabox_url)
+            except Exception as e:
+                logger.warning(f"nodriver failed ({e}), falling back to playwright...")
+                return await self._extract_files_playwright(terabox_url)
 
     async def _extract_files_nodriver(self, terabox_url: str) -> List[FileInfo]:
         """Extract files using nodriver (pure Python CDP automation)."""
@@ -253,7 +260,7 @@ class TeraBoxAutomator:
             if self.config.chrome_executable_path:
                 start_kwargs["browser_executable_path"] = self.config.chrome_executable_path
             if hasattr(os, "geteuid") and os.geteuid() == 0:
-                start_kwargs["no_sandbox"] = True
+                start_kwargs["sandbox"] = False
 
             browser = await uc.start(**start_kwargs)
             page = await browser.get("https://1024teradl.com/")
@@ -472,6 +479,8 @@ class TeraBoxAutomator:
         finally:
             if browser:
                 try:
+                    if hasattr(browser, "aclose"):
+                        await browser.aclose()
                     browser.stop()
                 except Exception:
                     pass
