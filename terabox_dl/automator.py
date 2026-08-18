@@ -131,6 +131,8 @@ def parse_proxy_json(json_data: Dict[str, Any]) -> List[FileInfo]:
                     isdir=isdir,
                 )
             )
+        elif not isdir and not download_url:
+            logger.warning(f"File '{filename}' was found, but 1024teradl.com failed to generate a direct download link. It may be too large or restricted.")
 
     return files
 
