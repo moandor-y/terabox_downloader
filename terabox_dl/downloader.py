@@ -253,11 +253,17 @@ class AsyncDownloader:
 
         async def _worker(file_info: FileInfo) -> DownloadResult:
             async with semaphore:
+                safe_name = sanitize_filename(file_info.filename)
                 task_id = progress.add_task(
-                    f"[cyan]{sanitize_filename(file_info.filename)}[/cyan]",
+                    f"[cyan]{safe_name}[/cyan]",
                     total=file_info.size_bytes if file_info.size_bytes > 0 else None,
                 )
                 res = await self.download_file(file_info, progress=progress, task_id=task_id)
+                progress.remove_task(task_id)
+                if res.status == DownloadStatus.COMPLETED:
+                    progress.console.print(f"[green]✓ Completed:[/green] {safe_name}")
+                else:
+                    progress.console.print(f"[red]✗ Failed:[/red] {safe_name} ({res.error})")
                 return res
 
         with progress:
