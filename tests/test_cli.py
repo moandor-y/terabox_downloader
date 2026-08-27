@@ -66,3 +66,46 @@ def test_cli_download_success(mock_automator_cls, mock_downloader_cls):
     assert "Found 1 downloadable file" in result.stdout
     assert "COMPLETED" in result.stdout
     assert "All 1 file(s) successfully downloaded" in result.stdout
+
+
+@patch("terabox_dl.cli.TeraBoxAutomator")
+def test_cli_ignore_files(mock_automator_cls):
+    mock_automator = mock_automator_cls.return_value
+    mock_automator.extract_files = AsyncMock(
+        return_value=[
+            FileInfo(
+                filename="demo.mp4",
+                download_url="https://d.1024teradl.com/dl/demo.mp4",
+                size_bytes=1048576,
+            ),
+            FileInfo(
+                filename="ignore_me.txt",
+                download_url="https://d.1024teradl.com/dl/ignore_me.txt",
+                size_bytes=1024,
+            )
+        ]
+    )
+
+    result = runner.invoke(app, ["https://terabox.com/s/1A2b3C4d5E6f7G8h9I0jKlM", "--dry-run", "-i", "ignore_me.txt"])
+    assert result.exit_code == 0
+    assert "demo.mp4" in result.stdout
+    assert "ignore_me.txt" not in result.stdout
+    assert "Ignored 1 file(s) based on --ignore list." in result.stdout
+
+
+@patch("terabox_dl.cli.TeraBoxAutomator")
+def test_cli_ignore_all_files(mock_automator_cls):
+    mock_automator = mock_automator_cls.return_value
+    mock_automator.extract_files = AsyncMock(
+        return_value=[
+            FileInfo(
+                filename="ignore_me.txt",
+                download_url="https://d.1024teradl.com/dl/ignore_me.txt",
+                size_bytes=1024,
+            )
+        ]
+    )
+
+    result = runner.invoke(app, ["https://terabox.com/s/1A2b3C4d5E6f7G8h9I0jKlM", "--dry-run", "-i", "ignore_me.txt"])
+    assert result.exit_code == 1
+    assert "All downloadable files were ignored." in result.stdout

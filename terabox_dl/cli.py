@@ -93,6 +93,7 @@ async def run_downloader(
     engine: str,
     chrome_path: Optional[str],
     dry_run: bool,
+    ignore: List[str],
 ) -> int:
     """Core async workflow for automating extraction and downloading."""
     if not is_valid_terabox_url(url):
@@ -131,6 +132,23 @@ async def run_downloader(
             "[bold yellow]⚠️  No downloadable files found for this TeraBox link.[/bold yellow]"
         )
         return 1
+
+    if ignore:
+        filtered_files = []
+        for f in files:
+            if f.filename not in ignore:
+                filtered_files.append(f)
+        
+        ignored_count = len(files) - len(filtered_files)
+        if ignored_count > 0:
+            console.print(f"[bold yellow]ℹ️  Ignored {ignored_count} file(s) based on --ignore list.[/bold yellow]")
+        files = filtered_files
+
+        if not files:
+            console.print(
+                "[bold yellow]⚠️  All downloadable files were ignored.[/bold yellow]"
+            )
+            return 1
 
     console.print(f"[bold green]✓ Found {len(files)} downloadable file(s)![/bold green]\n")
     print_files_table(files)
@@ -213,6 +231,12 @@ def main(
         "--dry-run",
         help="Extract and list download links without actually downloading the files",
     ),
+    ignore: List[str] = typer.Option(
+        None,
+        "--ignore",
+        "-i",
+        help="Filename to ignore during download (use multiple times to ignore multiple files, e.g., -i file1.txt -i file2.txt)",
+    ),
     verbose: bool = typer.Option(
         False,
         "--verbose",
@@ -233,6 +257,7 @@ def main(
             engine=engine,
             chrome_path=chrome_path,
             dry_run=dry_run,
+            ignore=ignore,
         )
     )
     sys.exit(exit_code)

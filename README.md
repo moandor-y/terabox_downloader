@@ -73,6 +73,12 @@ Use 15 retries with a 3-second initial backoff delay, or explicitly select the P
 terabox-dl "https://terabox.com/s/1A2b3C4d5E6f7G8h9I0jKlM" -r 15 --retry-delay 3.0 --engine playwright
 ```
 
+### 5. Ignoring Specific Files
+You can skip specific files during the download process by using the `-i` or `--ignore` option. Pass the option multiple times to ignore multiple files:
+```bash
+terabox-dl "https://terabox.com/s/1A2b3C4d5E6f7G8h9I0jKlM" -i "example_file1.mp4" -i "example_file2.jpg"
+```
+
 ---
 
 ## 🛠️ Command-Line Options
@@ -92,6 +98,7 @@ Options:
   -e, --engine          <str>    Browser automation engine ('auto', 'nodriver', or 'playwright') [default: auto]
   --chrome-path         <str>    Path to Google Chrome executable [default: /Applications/Google Chrome.app/Contents/MacOS/Google Chrome]
   --dry-run                      Extract and list download links without actually downloading the files
+  -i, --ignore          <str>    Filename to ignore during download (use multiple times to ignore multiple files, e.g., -i file1.txt -i file2.txt)
   -v, --verbose                  Enable verbose debug logging
   --help                         Show this message and exit.
 ```
