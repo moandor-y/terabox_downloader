@@ -350,7 +350,11 @@ class TeraBoxAutomator:
                         allBatches.push(data);
                         shareId = data.share_id || shareId;
                         uk = data.uk || uk;
-                        hasMore = Boolean(data.has_more);
+                        if (data.has_more !== undefined) {{
+                            hasMore = Boolean(data.has_more) && data.has_more !== '0' && data.has_more !== 0;
+                        }} else {{
+                            hasMore = true;
+                        }}
                         curPage = data.next_page || (curPage + 1);
                         if (!data.list || data.list.length === 0) break;
                     }} catch(e) {{
@@ -633,7 +637,11 @@ class TeraBoxAutomator:
                         allBatches.push(data);
                         shareId = data.share_id || shareId;
                         uk = data.uk || uk;
-                        hasMore = Boolean(data.has_more);
+                        if (data.has_more !== undefined) {{
+                            hasMore = Boolean(data.has_more) && data.has_more !== '0' && data.has_more !== 0;
+                        }} else {{
+                            hasMore = true;
+                        }}
                         curPage = data.next_page || (curPage + 1);
                         if (!data.list || data.list.length === 0) break;
                     }} catch(e) {{
