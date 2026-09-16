@@ -219,6 +219,238 @@ def parse_dom_files(html: str) -> List[FileInfo]:
     return files
 
 
+# Safety cap on the total number of /api/proxy list pages fetched for one share.
+MAX_LIST_PAGES = 200
+# Per-request retry attempts before giving up on a list page.
+LIST_REQUEST_ATTEMPTS = 3
+# Politeness delay between consecutive list page requests (avoids rate limiting).
+LIST_REQUEST_DELAY_MS = 150
+
+# In-page listing script executed inside the 1024teradl.com origin.
+#
+# It walks every page of the share (and every nested folder) via /api/proxy and
+# returns all raw batches plus diagnostics. Robustness rules:
+#   * transient fetch failures are retried instead of silently ending the walk;
+#   * pagination continues while pages come back full, even when the server
+#     omits or wrongly reports `has_more` (the cause of truncation at an exact
+#     multiple of the page size);
+#   * a page that yields no unseen items stops the walk for that folder, so a
+#     server that ignores `page` cannot loop forever;
+#   * if the walk ends early, `truncated`/`reason` say so instead of pretending
+#     the partial listing is complete.
+_LISTING_SCRIPT_TEMPLATE = """
+(async () => {
+    const teraboxUrl = __TERABOX_URL__;
+    const MAX_PAGES = __MAX_PAGES__;
+    const MAX_ATTEMPTS = __MAX_ATTEMPTS__;
+    const DELAY_MS = __DELAY_MS__;
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    const batches = [];
+    const seenItems = new Set();
+    // '' is the share root; nested folder paths are appended as they are found.
+    const pendingDirs = [''];
+    const knownDirs = new Set(['']);
+    let shareId = null;
+    let uk = null;
+    let pagesFetched = 0;
+    let truncated = false;
+    let reason = '';
+
+    const fetchPage = async (dir, page) => {
+        let lastError = '';
+        for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+            try {
+                const payload = { url: teraboxUrl, page: page };
+                if (shareId && uk) {
+                    payload.share_id = shareId;
+                    payload.uk = uk;
+                    payload.dir = dir;
+                }
+                const r = await fetch('/api/proxy', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                if (r.ok) {
+                    return { data: await r.json() };
+                }
+                lastError = 'HTTP ' + r.status;
+                // Client errors other than rate limiting will not succeed on retry.
+                if (r.status >= 400 && r.status < 500 && r.status !== 429) {
+                    return { error: lastError };
+                }
+            } catch (e) {
+                lastError = String(e);
+            }
+            await sleep(DELAY_MS * 4 * attempt);
+        }
+        return { error: lastError || 'request failed' };
+    };
+
+    walk:
+    while (pendingDirs.length > 0) {
+        const dir = pendingDirs.shift();
+        const dirLabel = dir ? " in folder '" + dir + "'" : '';
+        let page = 1;
+        let pageSize = 0;
+
+        while (true) {
+            if (pagesFetched >= MAX_PAGES) {
+                truncated = true;
+                reason = 'reached the ' + MAX_PAGES + ' page safety cap';
+                break walk;
+            }
+
+            const result = await fetchPage(dir, page);
+            if (result.error) {
+                truncated = true;
+                reason = 'request for page ' + page + dirLabel + ' failed: ' + result.error;
+                break walk;
+            }
+
+            const data = result.data || {};
+            if (data.errno && data.errno !== 0) {
+                const apiError = data.errmsg || data.msg || ('Error ' + data.errno);
+                if (pagesFetched === 0) {
+                    return JSON.stringify({ error: apiError });
+                }
+                truncated = true;
+                reason = 'API error on page ' + page + dirLabel + ': ' + apiError;
+                break walk;
+            }
+
+            pagesFetched++;
+            shareId = data.share_id || shareId;
+            uk = data.uk || uk;
+
+            const list = Array.isArray(data.list) ? data.list : [];
+            let freshItems = 0;
+            for (const item of list) {
+                if (!item || typeof item !== 'object') continue;
+                const key = String(
+                    item.fs_id || ((item.path || '') + '|' + (item.server_filename || item.filename || ''))
+                );
+                if (seenItems.has(key)) continue;
+                seenItems.add(key);
+                freshItems++;
+                if (item.isdir) {
+                    const childDir = item.path || '';
+                    if (childDir && !knownDirs.has(childDir)) {
+                        knownDirs.add(childDir);
+                        pendingDirs.push(childDir);
+                    }
+                }
+            }
+            if (freshItems > 0) {
+                batches.push(data);
+            }
+
+            if (list.length === 0) break;
+            // The server re-sent a page we already have, so paging cannot make
+            // progress here. Stop this folder, but flag the listing as partial.
+            if (freshItems === 0) {
+                truncated = true;
+                if (!reason) {
+                    reason = 'page ' + page + dirLabel +
+                        ' repeated items already seen (server ignored the page parameter)';
+                }
+                break;
+            }
+
+            if (page === 1) pageSize = list.length;
+            const fullPage = pageSize > 0 && list.length >= pageSize;
+            const rawHasMore = data.has_more;
+            const hasMoreKnown = rawHasMore !== undefined && rawHasMore !== null;
+            const hasMore = hasMoreKnown
+                ? (rawHasMore !== false && rawHasMore !== 0 && rawHasMore !== '0')
+                : false;
+            // Trust `has_more` only to keep going; a partial page is the
+            // reliable end-of-listing signal.
+            if (!hasMore && !fullPage) break;
+
+            const nextPage = Number(data.next_page);
+            page = Number.isFinite(nextPage) && nextPage > page ? nextPage : page + 1;
+            await sleep(DELAY_MS);
+        }
+    }
+
+    return JSON.stringify({
+        batches: batches,
+        pages: pagesFetched,
+        folders: knownDirs.size - 1,
+        truncated: truncated,
+        reason: reason
+    });
+})()
+"""
+
+
+def build_listing_script(terabox_url: str) -> str:
+    """Build the in-page JS that walks every list page of a TeraBox share."""
+    return (
+        _LISTING_SCRIPT_TEMPLATE
+        .replace("__TERABOX_URL__", json.dumps(terabox_url))
+        .replace("__MAX_PAGES__", str(MAX_LIST_PAGES))
+        .replace("__MAX_ATTEMPTS__", str(LIST_REQUEST_ATTEMPTS))
+        .replace("__DELAY_MS__", str(LIST_REQUEST_DELAY_MS))
+    )
+
+
+def consume_listing_result(raw_result: Any, captured_files: List[FileInfo]) -> Optional[str]:
+    """Parse the listing script output, extending captured_files with its batches.
+
+    Returns an API error message if the site reported one, otherwise None. A
+    warning is logged when the listing is known to be incomplete so a partial
+    result is never mistaken for the full share.
+    """
+    if not isinstance(raw_result, str):
+        return None
+    try:
+        result = json.loads(raw_result)
+    except (json.JSONDecodeError, TypeError):
+        logger.debug("Listing script returned a non-JSON payload")
+        return None
+    if not isinstance(result, dict):
+        return None
+
+    if result.get("error"):
+        return str(result["error"])
+
+    batches = result.get("batches") or []
+    for batch in batches:
+        try:
+            captured_files.extend(parse_proxy_json(batch))
+        except RuntimeError as err:
+            return str(err)
+
+    logger.debug(
+        "Listed %s page(s) across %s nested folder(s)",
+        result.get("pages", 0),
+        result.get("folders", 0),
+    )
+    if result.get("truncated"):
+        logger.warning(
+            "File listing is INCOMPLETE after %s page(s): %s. "
+            "Some files are missing - re-run the command to fetch the rest.",
+            result.get("pages", 0),
+            result.get("reason") or "unknown reason",
+        )
+    return None
+
+
+def dedupe_files(files: List[FileInfo]) -> List[FileInfo]:
+    """Drop duplicate entries, preferring fs_id over download URL as identity."""
+    unique: Dict[str, FileInfo] = {}
+    for f in files:
+        if not f.download_url:
+            continue
+        key = f"fs:{f.fs_id}" if f.fs_id else f"url:{f.download_url}"
+        if key not in unique:
+            unique[key] = f
+    return list(unique.values())
+
+
 class TeraBoxAutomator:
     """Automates 1024teradl.com using headless/headed browser to extract download links."""
 
@@ -319,61 +551,13 @@ class TeraBoxAutomator:
             page.add_handler(uc.cdp.network.LoadingFinished, on_loading_finished)
 
             # Direct In-Page Multi-Page Extraction (100% immune to UI ad blockers, overlays, modals, and popunders)
-            direct_fetch_script = f"""
-            (async () => {{
-                const teraboxUrl = {json.dumps(terabox_url)};
-                const allBatches = [];
-                let curPage = 1;
-                let hasMore = true;
-                let shareId = null;
-                let uk = null;
-                
-                while (hasMore && curPage <= 50) {{
-                    const payload = {{ url: teraboxUrl, page: curPage }};
-                    if (shareId && uk) {{
-                        payload.share_id = shareId;
-                        payload.uk = uk;
-                        payload.dir = '';
-                    }}
-                    
-                    try {{
-                        const r = await fetch('/api/proxy', {{
-                            method: 'POST',
-                            headers: {{ 'Content-Type': 'application/json' }},
-                            body: JSON.stringify(payload)
-                        }});
-                        if (!r.ok) break;
-                        const data = await r.json();
-                        if (data.errno && data.errno !== 0) {{
-                            return JSON.stringify({{ error: data.errmsg || data.msg || ('Error ' + data.errno) }});
-                        }}
-                        allBatches.push(data);
-                        shareId = data.share_id || shareId;
-                        uk = data.uk || uk;
-                        if (data.has_more !== undefined) {{
-                            hasMore = Boolean(data.has_more) && data.has_more !== '0' && data.has_more !== 0;
-                        }} else {{
-                            hasMore = true;
-                        }}
-                        curPage = data.next_page || (curPage + 1);
-                        if (!data.list || data.list.length === 0) break;
-                    }} catch(e) {{
-                        break;
-                    }}
-                }}
-                return JSON.stringify({{ batches: allBatches }});
-            }})()
-            """
             try:
-                fetch_res_raw = await page.evaluate(direct_fetch_script, await_promise=True)
-                if isinstance(fetch_res_raw, str):
-                    fetch_res = json.loads(fetch_res_raw)
-                    if "error" in fetch_res:
-                        api_error_message = fetch_res["error"]
-                    elif "batches" in fetch_res:
-                        for b in fetch_res["batches"]:
-                            parsed = parse_proxy_json(b)
-                            captured_files.extend(parsed)
+                fetch_res_raw = await page.evaluate(
+                    build_listing_script(terabox_url), await_promise=True
+                )
+                api_error_message = (
+                    consume_listing_result(fetch_res_raw, captured_files) or api_error_message
+                )
             except Exception as e:
                 logger.debug("Direct in-page fetch fallback: %s", e)
 
@@ -474,13 +658,7 @@ class TeraBoxAutomator:
                 dom_files = parse_dom_files(html)
                 captured_files.extend(dom_files)
 
-            # Deduplicate by download_url
-            unique_files: Dict[str, FileInfo] = {}
-            for f in captured_files:
-                if f.download_url and f.download_url not in unique_files:
-                    unique_files[f.download_url] = f
-
-            return list(unique_files.values())
+            return dedupe_files(captured_files)
 
         finally:
             if browser:
@@ -606,61 +784,11 @@ class TeraBoxAutomator:
                 await asyncio.sleep(1)
 
             # Direct In-Page Multi-Page Extraction (100% immune to UI ad blockers, overlays, modals, and popunders)
-            direct_fetch_script = f"""
-            (async () => {{
-                const teraboxUrl = {json.dumps(terabox_url)};
-                const allBatches = [];
-                let curPage = 1;
-                let hasMore = true;
-                let shareId = null;
-                let uk = null;
-                
-                while (hasMore && curPage <= 50) {{
-                    const payload = {{ url: teraboxUrl, page: curPage }};
-                    if (shareId && uk) {{
-                        payload.share_id = shareId;
-                        payload.uk = uk;
-                        payload.dir = '';
-                    }}
-                    
-                    try {{
-                        const r = await fetch('/api/proxy', {{
-                            method: 'POST',
-                            headers: {{ 'Content-Type': 'application/json' }},
-                            body: JSON.stringify(payload)
-                        }});
-                        if (!r.ok) break;
-                        const data = await r.json();
-                        if (data.errno && data.errno !== 0) {{
-                            return JSON.stringify({{ error: data.errmsg || data.msg || ('Error ' + data.errno) }});
-                        }}
-                        allBatches.push(data);
-                        shareId = data.share_id || shareId;
-                        uk = data.uk || uk;
-                        if (data.has_more !== undefined) {{
-                            hasMore = Boolean(data.has_more) && data.has_more !== '0' && data.has_more !== 0;
-                        }} else {{
-                            hasMore = true;
-                        }}
-                        curPage = data.next_page || (curPage + 1);
-                        if (!data.list || data.list.length === 0) break;
-                    }} catch(e) {{
-                        break;
-                    }}
-                }}
-                return JSON.stringify({{ batches: allBatches }});
-            }})()
-            """
             try:
-                fetch_res_raw = await page.evaluate(direct_fetch_script)
-                if isinstance(fetch_res_raw, str):
-                    fetch_res = json.loads(fetch_res_raw)
-                    if "error" in fetch_res:
-                        api_error_message = fetch_res["error"]
-                    elif "batches" in fetch_res:
-                        for b in fetch_res["batches"]:
-                            parsed = parse_proxy_json(b)
-                            captured_files.extend(parsed)
+                fetch_res_raw = await page.evaluate(build_listing_script(terabox_url))
+                api_error_message = (
+                    consume_listing_result(fetch_res_raw, captured_files) or api_error_message
+                )
             except Exception as e:
                 logger.debug("Playwright in-page fetch fallback: %s", e)
 
@@ -760,8 +888,4 @@ class TeraBoxAutomator:
 
             await browser.close()
 
-        unique_files: Dict[str, FileInfo] = {}
-        for f in captured_files:
-            if f.download_url and f.download_url not in unique_files:
-                unique_files[f.download_url] = f
-        return list(unique_files.values())
+        return dedupe_files(captured_files)

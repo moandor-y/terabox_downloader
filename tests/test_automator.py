@@ -1,7 +1,20 @@
 """Unit tests for automator.py."""
 
+import json
+import logging
+from typing import List
+
 import pytest
-from terabox_dl.automator import TeraBoxAutomator, parse_dom_files, parse_proxy_json
+from terabox_dl.automator import (
+    MAX_LIST_PAGES,
+    TeraBoxAutomator,
+    build_listing_script,
+    consume_listing_result,
+    dedupe_files,
+    parse_dom_files,
+    parse_proxy_json,
+)
+from terabox_dl.models import FileInfo
 
 
 def test_parse_proxy_json_success():
@@ -154,3 +167,103 @@ def test_parse_proxy_json_multi_page():
     assert all_files[0].filename == "part_0.bin"
     assert all_files[39].filename == "part_39.bin"
 
+
+def _batch(start: int, count: int) -> dict:
+    return {
+        "errno": 0,
+        "list": [
+            {
+                "fs_id": str(1000 + i),
+                "server_filename": f"part_{i}.bin",
+                "size": 1024,
+                "isdir": 0,
+                "dlink": f"https://d.1024teradl.com/download/part_{i}.bin",
+            }
+            for i in range(start, start + count)
+        ],
+    }
+
+
+def test_consume_listing_result_merges_all_pages():
+    raw = json.dumps(
+        {"batches": [_batch(0, 20), _batch(20, 20), _batch(40, 7)], "pages": 3, "folders": 0}
+    )
+    captured: List[FileInfo] = []
+
+    assert consume_listing_result(raw, captured) is None
+    assert len(captured) == 47
+    assert captured[-1].filename == "part_46.bin"
+
+
+def test_consume_listing_result_warns_when_truncated(caplog):
+    raw = json.dumps(
+        {
+            "batches": [_batch(0, 20)],
+            "pages": 1,
+            "folders": 0,
+            "truncated": True,
+            "reason": "request for page 2 failed: HTTP 429",
+        }
+    )
+    captured: List[FileInfo] = []
+
+    with caplog.at_level(logging.WARNING):
+        assert consume_listing_result(raw, captured) is None
+
+    assert len(captured) == 20
+    assert "INCOMPLETE" in caplog.text
+    assert "HTTP 429" in caplog.text
+
+
+def test_consume_listing_result_returns_api_error():
+    raw = json.dumps({"error": "File is not accessible"})
+    captured: List[FileInfo] = []
+
+    assert consume_listing_result(raw, captured) == "File is not accessible"
+    assert captured == []
+
+
+def test_consume_listing_result_ignores_bad_payload():
+    captured: List[FileInfo] = []
+
+    assert consume_listing_result("not json", captured) is None
+    assert consume_listing_result(None, captured) is None
+    assert captured == []
+
+
+def test_dedupe_files_uses_fs_id_identity():
+    files = [
+        FileInfo(filename="a.bin", download_url="https://d/a", fs_id="1"),
+        # Same file seen again on an overlapping page, with a refreshed link.
+        FileInfo(filename="a.bin", download_url="https://d/a?t=2", fs_id="1"),
+        # Distinct files that momentarily share a generic link must both survive.
+        FileInfo(filename="b.bin", download_url="https://d/same", fs_id="2"),
+        FileInfo(filename="c.bin", download_url="https://d/same", fs_id="3"),
+        # No fs_id: fall back to URL identity.
+        FileInfo(filename="d.bin", download_url="https://d/d"),
+        FileInfo(filename="d.bin", download_url="https://d/d"),
+        # Unusable entry.
+        FileInfo(filename="e.bin", download_url=""),
+    ]
+
+    unique = dedupe_files(files)
+
+    assert [f.filename for f in unique] == ["a.bin", "b.bin", "c.bin", "d.bin"]
+    assert unique[0].download_url == "https://d/a"
+
+
+def test_build_listing_script_has_no_placeholders():
+    script = build_listing_script("https://terabox.com/s/1abc")
+
+    assert "__TERABOX_URL__" not in script
+    assert "__MAX_PAGES__" not in script
+    assert "__MAX_ATTEMPTS__" not in script
+    assert "__DELAY_MS__" not in script
+    assert '"https://terabox.com/s/1abc"' in script
+    assert str(MAX_LIST_PAGES) in script
+
+
+def test_build_listing_script_escapes_url():
+    script = build_listing_script('https://terabox.com/s/"; alert(1); //')
+
+    assert '\\"; alert(1); //' in script
