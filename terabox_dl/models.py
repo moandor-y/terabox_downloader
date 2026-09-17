@@ -60,3 +60,7 @@ class DownloadConfig:
     chrome_executable_path: Optional[str] = (
         "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
     )
+    # Opt in to launching Chrome without its sandbox. Only has an effect when
+    # running as root, where Chrome cannot enable the sandbox at all. Off by
+    # default: see terabox_dl.automator.should_disable_sandbox.
+    allow_no_sandbox: bool = False

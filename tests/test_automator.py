@@ -5,16 +5,19 @@ import logging
 from typing import List
 
 import pytest
+from terabox_dl import automator
 from terabox_dl.automator import (
     MAX_LIST_PAGES,
     TeraBoxAutomator,
     build_listing_script,
+    check_sandbox_policy,
     consume_listing_result,
     dedupe_files,
     parse_dom_files,
     parse_proxy_json,
+    should_disable_sandbox,
 )
-from terabox_dl.models import FileInfo
+from terabox_dl.models import DownloadConfig, FileInfo
 
 
 def test_parse_proxy_json_success():
@@ -267,3 +270,48 @@ def test_build_listing_script_escapes_url():
     script = build_listing_script('https://terabox.com/s/"; alert(1); //')
 
     assert '\\"; alert(1); //' in script
+
+
+def test_sandbox_stays_enabled_for_non_root(monkeypatch):
+    monkeypatch.setattr(automator.os, "geteuid", lambda: 1000, raising=False)
+
+    assert should_disable_sandbox(allow_no_sandbox=False) is False
+    assert should_disable_sandbox(allow_no_sandbox=True) is False
+
+
+def test_root_without_optin_is_refused(monkeypatch):
+    monkeypatch.setattr(automator.os, "geteuid", lambda: 0, raising=False)
+
+    with pytest.raises(RuntimeError, match="Refusing to launch Chrome as root"):
+        should_disable_sandbox(allow_no_sandbox=False)
+    with pytest.raises(RuntimeError, match="Refusing to launch Chrome as root"):
+        check_sandbox_policy(allow_no_sandbox=False)
+
+
+def test_root_with_optin_disables_sandbox_and_warns(monkeypatch, caplog):
+    monkeypatch.setattr(automator.os, "geteuid", lambda: 0, raising=False)
+
+    with caplog.at_level(logging.WARNING):
+        assert should_disable_sandbox(allow_no_sandbox=True) is True
+
+    assert "WITHOUT the sandbox" in caplog.text
+
+
+async def test_extract_files_refuses_root_before_launching_browser(monkeypatch):
+    """The 'auto' engine must not fall back to playwright after a root refusal."""
+    monkeypatch.setattr(automator.os, "geteuid", lambda: 0, raising=False)
+    calls: List[str] = []
+
+    async def _fail(self, url):
+        calls.append("launched")
+        raise AssertionError("browser must not be launched as root")
+
+    monkeypatch.setattr(TeraBoxAutomator, "_extract_files_nodriver", _fail)
+    monkeypatch.setattr(TeraBoxAutomator, "_extract_files_playwright", _fail)
+
+    config = DownloadConfig(browser_engine="auto", allow_no_sandbox=False)
+    with pytest.raises(RuntimeError, match="Refusing to launch Chrome as root"):
+        await TeraBoxAutomator(config).extract_files("https://terabox.com/s/1abc")
+
+    assert calls == []
+

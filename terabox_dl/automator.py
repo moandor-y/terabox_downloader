@@ -67,6 +67,52 @@ AD_BLOCKED_PATTERNS = [
     "*creative.revcontent.com*",
 ]
 
+# Chrome cannot enable its setuid/namespace sandbox when running as root, so the
+# only way to launch as root is with the sandbox off. That sandbox is the main
+# containment boundary between a renderer exploit and the host, and this tool
+# deliberately loads an untrusted, ad-funded third-party page and runs script in
+# its origin. Silently disabling it therefore turns a malicious ad or renderer
+# bug into root-level code execution, so it is refused unless opted into.
+ROOT_SANDBOX_ERROR = (
+    "Refusing to launch Chrome as root: Chrome cannot enable its sandbox for the "
+    "root user, and this tool renders an untrusted third-party page with ads. "
+    "Without the sandbox, a renderer exploit would run as root on this machine.\n"
+    "Re-run as a non-root user. If this is a disposable container and you accept "
+    "that risk, pass --i-accept-no-sandbox."
+)
+
+
+def is_running_as_root() -> bool:
+    """Report whether this process has an effective UID of 0 (POSIX only)."""
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+def check_sandbox_policy(allow_no_sandbox: bool) -> None:
+    """Raise if Chrome could only be launched with its sandbox disabled.
+
+    Kept separate from should_disable_sandbox so callers can fail fast before
+    starting any browser without emitting the launch-time warning twice.
+    """
+    if is_running_as_root() and not allow_no_sandbox:
+        raise RuntimeError(ROOT_SANDBOX_ERROR)
+
+
+def should_disable_sandbox(allow_no_sandbox: bool) -> bool:
+    """Return whether Chrome must be launched without its sandbox.
+
+    Raises RuntimeError when running as root without an explicit opt-in. When the
+    caller has opted in, the degraded state is logged loudly rather than hidden.
+    """
+    check_sandbox_policy(allow_no_sandbox)
+    if not is_running_as_root():
+        return False
+    logger.warning(
+        "Launching Chrome as root WITHOUT the sandbox because --i-accept-no-sandbox "
+        "was given. A malicious ad or renderer exploit on the extraction page can "
+        "execute as root on this host."
+    )
+    return True
+
 
 def parse_proxy_json(json_data: Dict[str, Any]) -> List[FileInfo]:
     """Parse JSON response from 1024teradl.com /api/proxy into FileInfo objects."""
@@ -462,6 +508,10 @@ class TeraBoxAutomator:
         if not is_valid_terabox_url(terabox_url):
             raise ValueError(f"Invalid TeraBox shared link: {terabox_url}")
 
+        # Checked up front so the "auto" fallback below cannot mistake a refusal
+        # to run unsandboxed for an engine failure and retry the other engine.
+        check_sandbox_policy(self.config.allow_no_sandbox)
+
         if self.config.browser_engine == "playwright":
             return await self._extract_files_playwright(terabox_url)
         elif self.config.browser_engine == "nodriver":
@@ -493,7 +543,7 @@ class TeraBoxAutomator:
             }
             if self.config.chrome_executable_path:
                 start_kwargs["browser_executable_path"] = self.config.chrome_executable_path
-            if hasattr(os, "geteuid") and os.geteuid() == 0:
+            if should_disable_sandbox(self.config.allow_no_sandbox):
                 start_kwargs["sandbox"] = False
 
             browser = await uc.start(**start_kwargs)
@@ -693,7 +743,7 @@ class TeraBoxAutomator:
                 "--disable-infobars",
                 "--window-size=1920,1080",
             ]
-            if hasattr(os, "geteuid") and os.geteuid() == 0:
+            if should_disable_sandbox(self.config.allow_no_sandbox):
                 args.append("--no-sandbox")
 
             launch_kwargs = {

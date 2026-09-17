@@ -94,6 +94,7 @@ async def run_downloader(
     chrome_path: Optional[str],
     dry_run: bool,
     ignore: List[str],
+    allow_no_sandbox: bool = False,
 ) -> int:
     """Core async workflow for automating extraction and downloading."""
     if not is_valid_terabox_url(url):
@@ -108,6 +109,7 @@ async def run_downloader(
         browser_engine=engine,
         headless=headless,
         chrome_executable_path=chrome_path,
+        allow_no_sandbox=allow_no_sandbox,
     )
 
     console.print(
@@ -243,6 +245,15 @@ def main(
         "-v",
         help="Enable verbose debug logging",
     ),
+    allow_no_sandbox: bool = typer.Option(
+        False,
+        "--i-accept-no-sandbox",
+        help=(
+            "Allow running as root with the Chrome sandbox DISABLED. Unsafe: a "
+            "malicious ad on the extraction page could then execute as root. "
+            "Only use in a disposable container."
+        ),
+    ),
 ):
     """Automated concurrent resumable file downloader for TeraBox links using 1024teradl.com and browser automation."""
     setup_logging(verbose)
@@ -258,6 +269,7 @@ def main(
             chrome_path=chrome_path,
             dry_run=dry_run,
             ignore=ignore,
+            allow_no_sandbox=allow_no_sandbox,
         )
     )
     sys.exit(exit_code)
