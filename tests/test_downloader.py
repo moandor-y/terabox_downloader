@@ -115,3 +115,73 @@ async def test_download_all_concurrency(tmp_path):
     for r in results:
         assert r.status == DownloadStatus.COMPLETED
         assert r.bytes_downloaded == 4
+
+
+@pytest.mark.asyncio
+async def test_download_file_already_completed_unknown_size(tmp_path):
+    config = DownloadConfig(output_dir=str(tmp_path))
+    downloader = AsyncDownloader(config)
+
+    target_path = os.path.join(str(tmp_path), "unknown_size.bin")
+    with open(target_path, "wb") as f:
+        f.write(b"COMPLETED_CONTENT")
+
+    file_info = FileInfo(
+        filename="unknown_size.bin",
+        download_url="https://terabox.example.com/unknown_size",
+        size_bytes=0,
+    )
+
+    result = await downloader.download_file(file_info)
+    assert result.status == DownloadStatus.COMPLETED
+    assert result.attempts == 0
+    assert result.bytes_downloaded == len(b"COMPLETED_CONTENT")
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_download_file_resumes_across_cycles_with_fresh_url(tmp_path):
+    config = DownloadConfig(output_dir=str(tmp_path), max_retries=2, retry_delay=0.0)
+    downloader = AsyncDownloader(config)
+
+    # Cycle 1: downloads first 6 bytes of a 12-byte file, then fails both attempts
+    file_v1 = FileInfo(
+        filename="movie.mp4",
+        download_url="https://terabox.example.com/v1/movie.mp4?token=expired",
+        size_bytes=12,
+    )
+    respx.get("https://terabox.example.com/v1/movie.mp4?token=expired").mock(
+        return_value=httpx.Response(
+            200,
+            content=b"ABCDEF",
+            headers={"content-length": "12"},
+        )
+    )
+
+    res1 = await downloader.download_file(file_v1)
+    assert res1.status == DownloadStatus.FAILED
+    part_path = os.path.join(str(tmp_path), "movie.mp4.part")
+    assert os.path.exists(part_path)
+    assert os.path.getsize(part_path) == 6
+
+    # Cycle 2: fresh download URL resumes from byte 6 using HTTP 206 Range request
+    file_v2 = FileInfo(
+        filename="movie.mp4",
+        download_url="https://terabox.example.com/v2/movie.mp4?token=fresh",
+        size_bytes=12,
+    )
+    route_v2 = respx.get("https://terabox.example.com/v2/movie.mp4?token=fresh").mock(
+        return_value=httpx.Response(
+            206,
+            content=b"GHIJKL",
+            headers={"content-length": "6", "content-range": "bytes 6-11/12"},
+        )
+    )
+
+    res2 = await downloader.download_file(file_v2)
+    assert res2.status == DownloadStatus.COMPLETED
+    assert route_v2.called
+    assert route_v2.calls.last.request.headers.get("Range") == "bytes=6-"
+    assert not os.path.exists(part_path)
+    with open(res2.file_path, "rb") as f:
+        assert f.read() == b"ABCDEFGHIJKL"

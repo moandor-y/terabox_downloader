@@ -10,10 +10,112 @@ from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
 
-from terabox_dl.models import DownloadConfig, FileInfo
+from terabox_dl.models import (
+    CloudflareBlockError,
+    DownloadConfig,
+    ExtractedFileList,
+    FileInfo,
+    FileList,
+    FileListing,
+    SandboxPolicyError,
+)
 from terabox_dl.utils import is_valid_terabox_url, parse_size, sanitize_filename
 
 logger = logging.getLogger(__name__)
+
+CLOUDFLARE_TITLE_MARKERS = (
+    "just a moment",
+    "cloudflare",
+    "attention required",
+    "access denied",
+    "security check",
+    "verify you are human",
+    "verifying you are human",
+    "ddos-guard",
+    "one more step",
+)
+
+CLOUDFLARE_HTML_MARKERS = (
+    "attention required! | cloudflare",
+    "sorry, you have been blocked",
+    "you are unable to access",
+    "cf-error-details",
+    "cf-chl-bypass",
+    "cf-browser-verification",
+    'id="challenge-running"',
+    "id='challenge-running'",
+    'id="challenge-error-title"',
+    "id='challenge-error-title'",
+    'id="challenge-stage"',
+    "id='challenge-stage'",
+    "verify you are human",
+    "verifying you are human",
+    "checking if the site connection is secure",
+    "enable javascript and cookies to continue",
+    "__cf_chl_",
+    "_cf_chl_opt",
+    "cdn-cgi/challenge-platform",
+    "challenges.cloudflare.com",
+)
+
+
+def is_cloudflare_title(title: Optional[str]) -> bool:
+    """Return True if a page title indicates a Cloudflare challenge or block page."""
+    if not title or not isinstance(title, str):
+        return False
+    lowered = title.strip().lower()
+    return any(marker in lowered for marker in CLOUDFLARE_TITLE_MARKERS)
+
+
+def is_cloudflare_html(html: Optional[str]) -> bool:
+    """Return True if HTML content indicates a Cloudflare challenge or block page."""
+    if not html or not isinstance(html, str):
+        return False
+    lowered = html.lower()
+    if any(marker in lowered for marker in CLOUDFLARE_HTML_MARKERS):
+        return True
+    if "<title>" in lowered and any(marker in lowered for marker in CLOUDFLARE_TITLE_MARKERS):
+        return True
+    return False
+
+
+def is_cloudflare_challenge_or_block(
+    title: Optional[str] = None,
+    html: Optional[str] = None,
+    has_input: bool = False,
+    has_challenge_element: bool = False,
+) -> bool:
+    """Return True if page title, HTML, or challenge elements indicate a Cloudflare block/challenge."""
+    if is_cloudflare_title(title):
+        return True
+    if is_cloudflare_html(html):
+        return True
+    if has_challenge_element and not has_input:
+        return True
+    return False
+
+
+def is_cloudflare_error(exc: BaseException) -> bool:
+    """Return True if an exception represents a Cloudflare bot-detection or Turnstile block."""
+    if isinstance(exc, CloudflareBlockError):
+        return True
+    msg = str(exc).lower()
+    return any(
+        marker in msg
+        for marker in (
+            "cloudflare",
+            "turnstile",
+            "just a moment",
+            "attention required",
+            "verify you are human",
+            "verifying you are human",
+            "cf-chl",
+            "cf-error",
+            "bot detection",
+            "sorry, you have been blocked",
+            "access denied",
+        )
+    )
 
 # Common file extensions for direct download links
 FILE_EXTENSIONS = {
@@ -94,7 +196,7 @@ def check_sandbox_policy(allow_no_sandbox: bool) -> None:
     starting any browser without emitting the launch-time warning twice.
     """
     if is_running_as_root() and not allow_no_sandbox:
-        raise RuntimeError(ROOT_SANDBOX_ERROR)
+        raise SandboxPolicyError(ROOT_SANDBOX_ERROR)
 
 
 def should_disable_sandbox(allow_no_sandbox: bool) -> bool:
@@ -476,17 +578,26 @@ def consume_listing_result(raw_result: Any, captured_files: List[FileInfo]) -> O
         result.get("folders", 0),
     )
     if result.get("truncated"):
+        reason_str = str(result.get("reason") or "unknown reason")
+        try:
+            captured_files.truncated = True  # type: ignore[attr-defined]
+            captured_files.reason = reason_str  # type: ignore[attr-defined]
+            captured_files.truncation_reason = reason_str  # type: ignore[attr-defined]
+        except AttributeError:
+            pass
         logger.warning(
             "File listing is INCOMPLETE after %s page(s): %s. "
             "Some files are missing - re-run the command to fetch the rest.",
             result.get("pages", 0),
-            result.get("reason") or "unknown reason",
+            reason_str,
         )
     return None
 
 
-def dedupe_files(files: List[FileInfo]) -> List[FileInfo]:
+def dedupe_files(files: List[FileInfo]) -> ExtractedFileList:
     """Drop duplicate entries, preferring fs_id over download URL as identity."""
+    truncated = getattr(files, "truncated", False) is True
+    reason = getattr(files, "reason", None) or getattr(files, "truncation_reason", None)
     unique: Dict[str, FileInfo] = {}
     for f in files:
         if not f.download_url:
@@ -494,7 +605,7 @@ def dedupe_files(files: List[FileInfo]) -> List[FileInfo]:
         key = f"fs:{f.fs_id}" if f.fs_id else f"url:{f.download_url}"
         if key not in unique:
             unique[key] = f
-    return list(unique.values())
+    return ExtractedFileList(unique.values(), truncated=truncated, reason=reason)
 
 
 class TeraBoxAutomator:
@@ -502,9 +613,24 @@ class TeraBoxAutomator:
 
     def __init__(self, config: Optional[DownloadConfig] = None):
         self.config = config or DownloadConfig()
+        self.last_listing_truncated: bool = False
+        self.last_truncation_reason: Optional[str] = None
 
-    async def extract_files(self, terabox_url: str) -> List[FileInfo]:
+    def _finalize_extracted_files(self, files: List[FileInfo]) -> ExtractedFileList:
+        """Record truncation metadata on the automator instance and return ExtractedFileList."""
+        truncated = getattr(files, "truncated", False) is True
+        reason = getattr(files, "reason", None) or getattr(files, "truncation_reason", None)
+        self.last_listing_truncated = truncated
+        self.last_truncation_reason = reason
+        if isinstance(files, ExtractedFileList):
+            return files
+        return ExtractedFileList(files, truncated=truncated, reason=reason)
+
+    async def extract_files(self, terabox_url: str) -> ExtractedFileList:
         """Navigate to 1024teradl.com, submit TeraBox share link, and extract files."""
+        self.last_listing_truncated = False
+        self.last_truncation_reason = None
+
         if not is_valid_terabox_url(terabox_url):
             raise ValueError(f"Invalid TeraBox shared link: {terabox_url}")
 
@@ -513,23 +639,40 @@ class TeraBoxAutomator:
         check_sandbox_policy(self.config.allow_no_sandbox)
 
         if self.config.browser_engine == "playwright":
-            return await self._extract_files_playwright(terabox_url)
+            result = await self._extract_files_playwright(terabox_url)
+            return self._finalize_extracted_files(result)
         elif self.config.browser_engine == "nodriver":
-            return await self._extract_files_nodriver(terabox_url)
+            result = await self._extract_files_nodriver(terabox_url)
+            return self._finalize_extracted_files(result)
         else:
             # engine == "auto"
             try:
-                return await self._extract_files_nodriver(terabox_url)
-            except Exception as e:
-                logger.warning(f"nodriver failed ({e}), falling back to playwright...")
-                return await self._extract_files_playwright(terabox_url)
+                result = await self._extract_files_nodriver(terabox_url)
+                return self._finalize_extracted_files(result)
+            except (ValueError, SandboxPolicyError):
+                raise
+            except Exception as nodriver_exc:
+                logger.warning(f"nodriver failed ({nodriver_exc}), falling back to playwright...")
+                try:
+                    result = await self._extract_files_playwright(terabox_url)
+                    return self._finalize_extracted_files(result)
+                except CloudflareBlockError:
+                    raise
+                except Exception as pw_exc:
+                    if is_cloudflare_error(nodriver_exc):
+                        if isinstance(nodriver_exc, CloudflareBlockError):
+                            raise nodriver_exc from pw_exc
+                        raise CloudflareBlockError(str(nodriver_exc)) from pw_exc
+                    if is_cloudflare_error(pw_exc):
+                        raise CloudflareBlockError(str(pw_exc)) from pw_exc
+                    raise
 
-    async def _extract_files_nodriver(self, terabox_url: str) -> List[FileInfo]:
+    async def _extract_files_nodriver(self, terabox_url: str) -> ExtractedFileList:
         """Extract files using nodriver (pure Python CDP automation)."""
         import nodriver as uc
 
         browser = None
-        captured_files: List[FileInfo] = []
+        captured_files: ExtractedFileList = ExtractedFileList()
         api_error_message: Optional[str] = None
         pending_api_requests: Dict[str, str] = {}
 
@@ -541,7 +684,9 @@ class TeraBoxAutomator:
                     "--disable-blink-features=AutomationControlled",
                 ],
             }
-            if self.config.chrome_executable_path:
+            if self.config.chrome_executable_path and os.path.exists(
+                self.config.chrome_executable_path
+            ):
                 start_kwargs["browser_executable_path"] = self.config.chrome_executable_path
             if should_disable_sandbox(self.config.allow_no_sandbox):
                 start_kwargs["sandbox"] = False
@@ -550,19 +695,74 @@ class TeraBoxAutomator:
             page = await browser.get("https://1024teradl.com/")
 
             # Wait for Cloudflare Turnstile challenge if present
-            for _ in range(30):
-                await asyncio.sleep(1)
-                title = await page.evaluate("document.title")
-                if title and "Just a moment" not in title and "Cloudflare" not in title:
+            challenge_resolved = False
+            challenge_repeated = False
+            last_title: Optional[str] = None
+            had_challenge_iframe = False
+            challenge_clicks = 0
+            last_click_attempt: Optional[int] = None
+            attempts = max(1, int(self.config.challenge_timeout_attempts))
+            poll_interval = max(0.0, float(self.config.challenge_poll_interval))
+            max_clicks = max(1, int(self.config.challenge_max_clicks))
+            cooldown_attempts = max(1, int(self.config.challenge_click_cooldown_attempts))
+
+            for attempt_idx in range(attempts):
+                await asyncio.sleep(poll_interval)
+                try:
+                    title_val = await page.evaluate("document.title")
+                    last_title = title_val if isinstance(title_val, str) else None
+                except Exception:
+                    last_title = None
+
+                if last_title and not is_cloudflare_title(last_title):
+                    challenge_resolved = True
                     break
+
                 try:
                     iframe = await page.select(
                         "iframe[src*='cloudflare'], iframe[src*='turnstile'], iframe[title*='Cloudflare'], iframe[title*='challenge']"
                     )
                     if iframe:
-                        await iframe.mouse_click()
+                        had_challenge_iframe = True
+                        if (
+                            challenge_clicks >= max_clicks
+                            and last_click_attempt is not None
+                            and (attempt_idx - last_click_attempt) >= cooldown_attempts
+                        ):
+                            challenge_repeated = True
+                            break
+                        if challenge_clicks < max_clicks and (
+                            last_click_attempt is None
+                            or (attempt_idx - last_click_attempt) >= cooldown_attempts
+                        ):
+                            await iframe.mouse_click()
+                            challenge_clicks += 1
+                            last_click_attempt = attempt_idx
                 except Exception:
                     pass
+
+            if not challenge_resolved:
+                if challenge_repeated:
+                    raise CloudflareBlockError(
+                        f"Blocked by Cloudflare bot detection: Turnstile challenge repeated after {challenge_clicks} click attempts (title={last_title!r})."
+                    )
+                html_after_wait: Optional[str] = None
+                try:
+                    raw_html = await page.get_content()
+                    if isinstance(raw_html, str):
+                        html_after_wait = raw_html
+                except Exception:
+                    html_after_wait = None
+
+                if is_cloudflare_challenge_or_block(
+                    last_title,
+                    html_after_wait,
+                    has_input=False,
+                    has_challenge_element=had_challenge_iframe,
+                ):
+                    raise CloudflareBlockError(
+                        f"Blocked by Cloudflare bot detection or unresolved Turnstile challenge (title={last_title!r})."
+                    )
 
             # Enable CDP network domain and block ad networks
             await page.send(uc.cdp.network.enable())
@@ -696,19 +896,33 @@ class TeraBoxAutomator:
 
                 # Wait for initial response or DOM update
                 for _ in range(15):
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(poll_interval)
                     if captured_files or api_error_message:
                         break
 
             if api_error_message:
+                if is_cloudflare_error(RuntimeError(api_error_message)) or is_cloudflare_html(
+                    api_error_message
+                ):
+                    raise CloudflareBlockError(api_error_message)
                 raise RuntimeError(api_error_message)
 
             if not captured_files:
                 html = await page.get_content()
-                dom_files = parse_dom_files(html)
+                html_str = html if isinstance(html, str) else ""
+                dom_files = parse_dom_files(html_str)
                 captured_files.extend(dom_files)
+                if not captured_files and is_cloudflare_challenge_or_block(
+                    last_title,
+                    html_str,
+                    has_input=False,
+                    has_challenge_element=had_challenge_iframe,
+                ):
+                    raise CloudflareBlockError(
+                        f"Blocked by Cloudflare bot detection or unresolved Turnstile challenge (title={last_title!r})."
+                    )
 
-            return dedupe_files(captured_files)
+            return self._finalize_extracted_files(dedupe_files(captured_files))
 
         finally:
             if browser:
@@ -719,14 +933,30 @@ class TeraBoxAutomator:
                 except Exception:
                     pass
 
-    async def _extract_files_playwright(self, terabox_url: str) -> List[FileInfo]:
+    async def _extract_files_playwright(self, terabox_url: str) -> ExtractedFileList:
         """Extract files using Playwright with stealth (if available in environment)."""
         try:
             from playwright.async_api import async_playwright
             try:
                 from playwright_stealth import Stealth
+
                 async def _apply_stealth(page):
-                    await Stealth().apply_stealth_async(page)
+                    try:
+                        # Disable overrides that spoof a mismatched OS/GPU ("Win32" /
+                        # "Intel Iris") in Window while leaving Turnstile WebWorkers
+                        # with the native OS/GPU, which triggers repeating Turnstile loops.
+                        stealth_cfg = Stealth(
+                            navigator_platform=False,
+                            navigator_platform_override=None,
+                            webgl_vendor=False,
+                            navigator_plugins=False,
+                            iframe_content_window=False,
+                            error_prototype=False,
+                            navigator_hardware_concurrency=False,
+                        )
+                    except TypeError:
+                        stealth_cfg = Stealth()
+                    await stealth_cfg.apply_stealth_async(page)
             except ImportError:
                 from playwright_stealth import stealth_async as _apply_stealth
         except ImportError as exc:
@@ -734,7 +964,7 @@ class TeraBoxAutomator:
                 "Playwright or playwright-stealth is not installed or available."
             ) from exc
 
-        captured_files: List[FileInfo] = []
+        captured_files: ExtractedFileList = ExtractedFileList()
         api_error_message: Optional[str] = None
 
         async with async_playwright() as p:
@@ -746,9 +976,10 @@ class TeraBoxAutomator:
             if should_disable_sandbox(self.config.allow_no_sandbox):
                 args.append("--no-sandbox")
 
-            launch_kwargs = {
+            launch_kwargs: Dict[str, Any] = {
                 "headless": self.config.headless,
                 "args": args,
+                "ignore_default_args": ["--enable-automation"],
             }
             if self.config.chrome_executable_path and os.path.exists(
                 self.config.chrome_executable_path
@@ -766,176 +997,298 @@ class TeraBoxAutomator:
                 launch_kwargs.pop("channel", None)
                 browser = await p.chromium.launch(**launch_kwargs)
 
-            context = await browser.new_context(
-                viewport={"width": 1920, "height": 1080},
-            )
-            page = await context.new_page()
-            await _apply_stealth(page)
+            try:
+                context_kwargs: Dict[str, Any] = (
+                    {"viewport": {"width": 1920, "height": 1080}}
+                    if self.config.headless
+                    else {"no_viewport": True}
+                )
+                context = await browser.new_context(**context_kwargs)
+                page = await context.new_page()
+                await _apply_stealth(page)
 
-            async def handle_response(response):
-                nonlocal api_error_message
-                if "proxy" in response.url or "teradl.com/api" in response.url:
-                    try:
-                        text = await response.text()
-                        if text:
-                            data = json.loads(text)
-                            try:
-                                parsed = parse_proxy_json(data)
-                                captured_files.extend(parsed)
-                            except RuntimeError as err:
-                                api_error_message = str(err)
-                    except Exception:
-                        pass
-
-            page.on("response", handle_response)
-            await page.goto("https://1024teradl.com/", wait_until="domcontentloaded", timeout=60000)
-
-            # Wait for Cloudflare Turnstile challenge to resolve and input box to appear
-            for _ in range(30):
-                title = await page.title()
-                if title and "Just a moment" not in title and "Cloudflare" not in title:
-                    try:
-                        inp = await page.wait_for_selector(
-                            "input[placeholder*='Terabox'], input", timeout=1000
-                        )
-                        if inp:
-                            break
-                    except Exception:
-                        pass
-                try:
-                    for iframe_sel in [
-                        "iframe[src*='cloudflare']",
-                        "iframe[src*='turnstile']",
-                        "iframe[title*='Cloudflare']",
-                        "iframe[title*='challenge']",
-                    ]:
-                        el = await page.query_selector(iframe_sel)
-                        if el:
-                            box = await el.bounding_box()
-                            if box and box["width"] > 0 and box["height"] > 0:
-                                await page.mouse.click(
-                                    box["x"] + box["width"] / 2,
-                                    box["y"] + box["height"] / 2,
-                                )
-                            break
-                except Exception:
-                    pass
-                for frame in page.frames:
-                    if "cloudflare" in frame.url or "turnstile" in frame.url:
+                async def handle_response(response):
+                    nonlocal api_error_message
+                    if "proxy" in response.url or "teradl.com/api" in response.url:
                         try:
-                            checkbox = await frame.wait_for_selector(
-                                "input[type='checkbox'], .cb-lb, #challenge-stage",
-                                timeout=500,
-                            )
-                            if checkbox:
-                                await checkbox.click()
+                            text = await response.text()
+                            if text:
+                                data = json.loads(text)
+                                try:
+                                    parsed = parse_proxy_json(data)
+                                    captured_files.extend(parsed)
+                                except RuntimeError as err:
+                                    api_error_message = str(err)
                         except Exception:
                             pass
-                await asyncio.sleep(1)
 
-            # Direct In-Page Multi-Page Extraction (100% immune to UI ad blockers, overlays, modals, and popunders)
-            try:
-                fetch_res_raw = await page.evaluate(build_listing_script(terabox_url))
-                api_error_message = (
-                    consume_listing_result(fetch_res_raw, captured_files) or api_error_message
-                )
-            except Exception as e:
-                logger.debug("Playwright in-page fetch fallback: %s", e)
+                page.on("response", handle_response)
+                await page.goto("https://1024teradl.com/", wait_until="domcontentloaded", timeout=60000)
 
-            # If not captured via direct fetch, fall back to UI form submission
-            if not captured_files and not api_error_message:
-                # Block popunder/popup ads and clean ad overlay backdrops
-                cleanup_script = """
-                (() => {
-                    window.open = function() { return null; };
-                    const adSelectors = [
-                        'ins.adsbygoogle',
-                        '[id*="google_ads"]',
-                        '[id*="aswift"]',
-                        'iframe[src*="ad"]',
-                        'iframe[id*="ad"]',
-                        '[class*="ad-"]',
-                        '[class*="ads-"]',
-                        '[class*="ad_"]',
-                        '[id*="pop"]',
-                        '[class*="popup"]',
-                        '[class*="overlay"]',
-                        '[class*="modal"]',
-                        '.ad-container',
-                        '.ads-wrapper',
-                    ];
-                    for (const sel of adSelectors) {
-                        document.querySelectorAll(sel).forEach(el => {
-                            if (!el.querySelector('input') && !el.querySelector('iframe[src*="turnstile"]') && !el.querySelector('iframe[src*="cloudflare"]')) {
-                                el.remove();
+                # Wait for Cloudflare Turnstile challenge to resolve and input box to appear
+                challenge_resolved = False
+                challenge_repeated = False
+                last_title: Optional[str] = None
+                had_challenge_element = False
+                challenge_clicks = 0
+                last_click_attempt: Optional[int] = None
+                attempts = max(1, int(self.config.challenge_timeout_attempts))
+                poll_interval = max(0.0, float(self.config.challenge_poll_interval))
+                max_clicks = max(1, int(self.config.challenge_max_clicks))
+                cooldown_attempts = max(1, int(self.config.challenge_click_cooldown_attempts))
+
+                for attempt_idx in range(attempts):
+                    try:
+                        title_val = await page.title()
+                        last_title = title_val if isinstance(title_val, str) else None
+                    except Exception:
+                        last_title = None
+
+                    if last_title and not is_cloudflare_title(last_title):
+                        try:
+                            inp = await page.wait_for_selector(
+                                "input[placeholder*='Terabox'], input[placeholder*='terabox'], input[type='url'], input[type='text']",
+                                timeout=1000,
+                            )
+                            if inp:
+                                challenge_resolved = True
+                                break
+                        except Exception:
+                            pass
+
+                    target_box: Optional[Dict[str, float]] = None
+                    found_challenge_this_poll = False
+                    try:
+                        for iframe_sel in [
+                            "iframe[src*='cloudflare']",
+                            "iframe[src*='turnstile']",
+                            "iframe[title*='Cloudflare']",
+                            "iframe[title*='challenge']",
+                            "#turnstile-wrapper",
+                            ".cf-turnstile",
+                            "#cf-turnstile",
+                            "#challenge-stage",
+                        ]:
+                            el = await page.query_selector(iframe_sel)
+                            if el:
+                                had_challenge_element = True
+                                found_challenge_this_poll = True
+                                box = await el.bounding_box()
+                                if box and box.get("width", 0) > 0 and box.get("height", 0) > 0:
+                                    target_box = box
+                                break
+                    except Exception:
+                        pass
+
+                    cf_frames = []
+                    for frame in getattr(page, "frames", []) or []:
+                        frame_url = getattr(frame, "url", "") or ""
+                        if "cloudflare" in frame_url or "turnstile" in frame_url:
+                            had_challenge_element = True
+                            found_challenge_this_poll = True
+                            cf_frames.append(frame)
+                            if target_box is None and hasattr(frame, "frame_element"):
+                                try:
+                                    frame_el = await frame.frame_element()
+                                    if frame_el and hasattr(frame_el, "bounding_box"):
+                                        box = await frame_el.bounding_box()
+                                        if (
+                                            isinstance(box, dict)
+                                            and box.get("width", 0) > 0
+                                            and box.get("height", 0) > 0
+                                        ):
+                                            target_box = box
+                                except Exception:
+                                    pass
+
+                    if found_challenge_this_poll:
+                        if (
+                            challenge_clicks >= max_clicks
+                            and last_click_attempt is not None
+                            and (attempt_idx - last_click_attempt) >= cooldown_attempts
+                        ):
+                            challenge_repeated = True
+                            break
+
+                        if challenge_clicks < max_clicks and (
+                            last_click_attempt is None
+                            or (attempt_idx - last_click_attempt) >= cooldown_attempts
+                        ):
+                            clicked_this_poll = False
+                            if target_box is not None:
+                                try:
+                                    width = float(target_box["width"])
+                                    height = float(target_box["height"])
+                                    offset_x = min(28.0, width / 2.0) if width >= 60.0 else width / 2.0
+                                    click_x = float(target_box["x"]) + offset_x
+                                    click_y = float(target_box["y"]) + height / 2.0
+                                    if hasattr(page, "mouse") and hasattr(page.mouse, "move"):
+                                        await page.mouse.move(click_x, click_y, steps=5)
+                                    await page.mouse.click(click_x, click_y)
+                                    clicked_this_poll = True
+                                except Exception:
+                                    pass
+
+                            if not clicked_this_poll:
+                                for frame in cf_frames:
+                                    try:
+                                        checkbox = await frame.wait_for_selector(
+                                            "input[type='checkbox'], .cb-lb, #challenge-stage",
+                                            timeout=500,
+                                        )
+                                        if checkbox:
+                                            await checkbox.click()
+                                            clicked_this_poll = True
+                                            break
+                                    except Exception:
+                                        pass
+
+                            if clicked_this_poll:
+                                challenge_clicks += 1
+                                last_click_attempt = attempt_idx
+
+                    await asyncio.sleep(poll_interval)
+
+                if not challenge_resolved:
+                    if challenge_repeated:
+                        raise CloudflareBlockError(
+                            f"Blocked by Cloudflare bot detection: Turnstile challenge repeated after {challenge_clicks} click attempts (title={last_title!r})."
+                        )
+                    html_after_wait: Optional[str] = None
+                    try:
+                        raw_html = await page.content()
+                        if isinstance(raw_html, str):
+                            html_after_wait = raw_html
+                    except Exception:
+                        html_after_wait = None
+
+                    if is_cloudflare_challenge_or_block(
+                        last_title,
+                        html_after_wait,
+                        has_input=False,
+                        has_challenge_element=had_challenge_element,
+                    ):
+                        raise CloudflareBlockError(
+                            f"Blocked by Cloudflare bot detection or unresolved Turnstile challenge (title={last_title!r})."
+                        )
+
+                # Direct In-Page Multi-Page Extraction (100% immune to UI ad blockers, overlays, modals, and popunders)
+                try:
+                    fetch_res_raw = await page.evaluate(build_listing_script(terabox_url))
+                    api_error_message = (
+                        consume_listing_result(fetch_res_raw, captured_files) or api_error_message
+                    )
+                except Exception as e:
+                    logger.debug("Playwright in-page fetch fallback: %s", e)
+
+                # If not captured via direct fetch, fall back to UI form submission
+                if not captured_files and not api_error_message:
+                    # Block popunder/popup ads and clean ad overlay backdrops
+                    cleanup_script = """
+                    (() => {
+                        window.open = function() { return null; };
+                        const adSelectors = [
+                            'ins.adsbygoogle',
+                            '[id*="google_ads"]',
+                            '[id*="aswift"]',
+                            'iframe[src*="ad"]',
+                            'iframe[id*="ad"]',
+                            '[class*="ad-"]',
+                            '[class*="ads-"]',
+                            '[class*="ad_"]',
+                            '[id*="pop"]',
+                            '[class*="popup"]',
+                            '[class*="overlay"]',
+                            '[class*="modal"]',
+                            '.ad-container',
+                            '.ads-wrapper',
+                        ];
+                        for (const sel of adSelectors) {
+                            document.querySelectorAll(sel).forEach(el => {
+                                if (!el.querySelector('input') && !el.querySelector('iframe[src*="turnstile"]') && !el.querySelector('iframe[src*="cloudflare"]')) {
+                                    el.remove();
+                                }
+                            });
+                        }
+                        document.querySelectorAll('div, section, aside, span, a').forEach(el => {
+                            const style = window.getComputedStyle(el);
+                            if ((style.position === 'fixed' || style.position === 'absolute') && parseInt(style.zIndex, 10) >= 100) {
+                                if (!el.querySelector('input') && !el.querySelector('iframe[src*="turnstile"]') && !el.querySelector('iframe[src*="cloudflare"]') && !el.querySelector('button[type="submit"]')) {
+                                    el.remove();
+                                }
                             }
                         });
-                    }
-                    document.querySelectorAll('div, section, aside, span, a').forEach(el => {
-                        const style = window.getComputedStyle(el);
-                        if ((style.position === 'fixed' || style.position === 'absolute') && parseInt(style.zIndex, 10) >= 100) {
-                            if (!el.querySelector('input') && !el.querySelector('iframe[src*="turnstile"]') && !el.querySelector('iframe[src*="cloudflare"]') && !el.querySelector('button[type="submit"]')) {
-                                el.remove();
-                            }
-                        }
-                    });
-                })()
-                """
-                try:
-                    await page.evaluate(cleanup_script)
-                except Exception:
-                    pass
+                    })()
+                    """
+                    try:
+                        await page.evaluate(cleanup_script)
+                    except Exception:
+                        pass
 
-                # Fill input and submit using robust JavaScript event dispatching
-                submit_script = f"""
-                (() => {{
-                    const targetUrl = {json.dumps(terabox_url)};
-                    const inp = document.querySelector('input[placeholder*="Terabox"]') ||
-                              document.querySelector('input[type="text"]') ||
-                              document.querySelector('input[type="url"]') ||
-                              document.querySelector('input:not([type="hidden"])');
-                    if (inp) {{
-                        const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
-                        nativeSetter.call(inp, targetUrl);
-                        inp.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                        inp.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                    }}
-                    const btn = document.querySelector('button[type="submit"]') ||
-                                document.querySelector('form button') ||
-                                document.querySelector('button');
-                    if (btn) {{
-                        btn.click();
-                    }}
-                    const form = document.querySelector('form');
-                    if (form) {{
-                        form.dispatchEvent(new Event('submit', {{ bubbles: true, cancelable: true }}));
-                    }}
-                }})()
-                """
-                try:
-                    await page.evaluate(submit_script)
-                except Exception:
-                    pass
+                    # Fill input and submit using robust JavaScript event dispatching
+                    submit_script = f"""
+                    (() => {{
+                        const targetUrl = {json.dumps(terabox_url)};
+                        const inp = document.querySelector('input[placeholder*="Terabox"]') ||
+                                  document.querySelector('input[type="text"]') ||
+                                  document.querySelector('input[type="url"]') ||
+                                  document.querySelector('input:not([type="hidden"])');
+                        if (inp) {{
+                            const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+                            nativeSetter.call(inp, targetUrl);
+                            inp.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                            inp.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                        }}
+                        const btn = document.querySelector('button[type="submit"]') ||
+                                    document.querySelector('form button') ||
+                                    document.querySelector('button');
+                        if (btn) {{
+                            btn.click();
+                        }}
+                        const form = document.querySelector('form');
+                        if (form) {{
+                            form.dispatchEvent(new Event('submit', {{ bubbles: true, cancelable: true }}));
+                        }}
+                    }})()
+                    """
+                    try:
+                        await page.evaluate(submit_script)
+                    except Exception:
+                        pass
 
-                try:
-                    await page.fill("input[placeholder*='Terabox']", terabox_url)
-                    await page.click("button[type='submit']")
-                except Exception:
-                    pass
+                    try:
+                        await page.fill("input[placeholder*='Terabox']", terabox_url)
+                        await page.click("button[type='submit']")
+                    except Exception:
+                        pass
 
-                # Wait for initial response or DOM update
-                for _ in range(15):
-                    await asyncio.sleep(1)
-                    if captured_files or api_error_message:
-                        break
+                    # Wait for initial response or DOM update
+                    for _ in range(15):
+                        await asyncio.sleep(poll_interval)
+                        if captured_files or api_error_message:
+                            break
 
-            if api_error_message:
-                raise RuntimeError(api_error_message)
+                if api_error_message:
+                    if is_cloudflare_error(RuntimeError(api_error_message)) or is_cloudflare_html(
+                        api_error_message
+                    ):
+                        raise CloudflareBlockError(api_error_message)
+                    raise RuntimeError(api_error_message)
 
-            if not captured_files:
-                html = await page.content()
-                captured_files.extend(parse_dom_files(html))
+                if not captured_files:
+                    html = await page.content()
+                    html_str = html if isinstance(html, str) else ""
+                    captured_files.extend(parse_dom_files(html_str))
+                    if not captured_files and is_cloudflare_challenge_or_block(
+                        last_title,
+                        html_str,
+                        has_input=False,
+                        has_challenge_element=had_challenge_element,
+                    ):
+                        raise CloudflareBlockError(
+                            f"Blocked by Cloudflare bot detection or unresolved Turnstile challenge (title={last_title!r})."
+                        )
+            finally:
+                await browser.close()
 
-            await browser.close()
-
-        return dedupe_files(captured_files)
+        return self._finalize_extracted_files(dedupe_files(captured_files))

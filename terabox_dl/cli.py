@@ -4,7 +4,7 @@ import asyncio
 import logging
 import os
 import sys
-from typing import List, Optional
+from typing import Dict, List, Optional, Set
 
 import typer
 from rich.console import Console
@@ -12,10 +12,24 @@ from rich.logging import RichHandler
 from rich.table import Table
 
 from terabox_dl import __version__
-from terabox_dl.automator import TeraBoxAutomator
+from terabox_dl.automator import (
+    ROOT_SANDBOX_ERROR,
+    TeraBoxAutomator,
+    is_cloudflare_error,
+)
 from terabox_dl.downloader import AsyncDownloader
-from terabox_dl.models import DownloadConfig, DownloadResult, DownloadStatus, FileInfo
-from terabox_dl.utils import format_bytes, is_valid_terabox_url
+from terabox_dl.models import (
+    CloudflareBlockError,
+    DownloadConfig,
+    DownloadResult,
+    DownloadStatus,
+    ExtractedFileList,
+    FileInfo,
+    FileList,
+    FileListing,
+    SandboxPolicyError,
+)
+from terabox_dl.utils import format_bytes, is_valid_terabox_url, sanitize_filename
 
 app = typer.Typer(
     name="terabox-dl",
@@ -83,6 +97,37 @@ def print_results_table(results: List[DownloadResult]):
     console.print(table)
 
 
+def _file_identity(file_info: FileInfo) -> str:
+    """Return a stable cross-cycle identity key for a FileInfo item."""
+    if file_info.fs_id:
+        return f"fs:{file_info.fs_id}"
+    return f"name:{sanitize_filename(file_info.filename)}"
+
+
+def _is_unrecoverable_error(exc: BaseException) -> bool:
+    """Return True if an extraction error is unrecoverable and must abort immediately."""
+    if isinstance(exc, (ValueError, SandboxPolicyError, CloudflareBlockError)):
+        return True
+    if is_cloudflare_error(exc):
+        return True
+    msg = str(exc).lower()
+    if (
+        ROOT_SANDBOX_ERROR.lower() in msg
+        or "refusing to launch chrome as root" in msg
+    ):
+        return True
+    return False
+
+
+def _is_listing_truncated(files: List[FileInfo], automator: object) -> bool:
+    """Check whether the extracted file listing was flagged as truncated/incomplete."""
+    return (
+        getattr(files, "truncated", False) is True
+        or getattr(automator, "last_listing_truncated", False) is True
+        or any(getattr(f, "truncated", False) is True for f in (files or []))
+    )
+
+
 async def run_downloader(
     url: str,
     output_dir: str,
@@ -121,66 +166,171 @@ async def run_downloader(
     )
 
     automator = TeraBoxAutomator(config)
-    console.print("[cyan]🔍 Step 1: Extracting download links via 1024teradl.com...[/cyan]")
+    downloader: Optional[AsyncDownloader] = None
+    discovered_files: Dict[str, FileInfo] = {}
+    completed_results: Dict[str, DownloadResult] = {}
+    completed_filenames: Set[str] = set()
+    cycle = 0
 
-    try:
-        files = await automator.extract_files(url)
-    except Exception as exc:
-        console.print(f"[bold red]✗ Extraction failed:[/bold red] {exc}")
-        return 1
+    def _is_completed(f: FileInfo) -> bool:
+        key = _file_identity(f)
+        if key in completed_results:
+            return True
+        name_key = f"name:{sanitize_filename(f.filename)}"
+        if name_key in completed_results:
+            return True
+        if not f.fs_id and sanitize_filename(f.filename) in completed_filenames:
+            return True
+        return False
 
-    if not files:
-        console.print(
-            "[bold yellow]⚠️  No downloadable files found for this TeraBox link.[/bold yellow]"
-        )
-        return 1
+    while True:
+        cycle += 1
+        if cycle == 1:
+            console.print("[cyan]🔍 Step 1: Extracting download links via 1024teradl.com...[/cyan]")
+        else:
+            console.print(
+                f"\n[bold yellow]🔄 Retry cycle {cycle}: Re-extracting download links via 1024teradl.com...[/bold yellow]"
+            )
 
-    if ignore:
-        filtered_files = []
-        for f in files:
-            if f.filename not in ignore:
-                filtered_files.append(f)
-        
-        ignored_count = len(files) - len(filtered_files)
-        if ignored_count > 0:
-            console.print(f"[bold yellow]ℹ️  Ignored {ignored_count} file(s) based on --ignore list.[/bold yellow]")
-        files = filtered_files
+        if isinstance(getattr(automator, "last_listing_truncated", None), bool):
+            automator.last_listing_truncated = False
+
+        try:
+            files = await automator.extract_files(url)
+        except (StopIteration, StopAsyncIteration):
+            raise
+        except Exception as exc:
+            if _is_unrecoverable_error(exc):
+                console.print(f"[bold red]✗ Extraction failed:[/bold red] {exc}")
+                return 1
+            console.print(
+                f"[bold yellow]⚠️  Extraction failed (cycle {cycle}): {exc}. Retrying...[/bold yellow]"
+            )
+            if config.retry_delay > 0:
+                await asyncio.sleep(config.retry_delay)
+            continue
+
+        is_truncated = _is_listing_truncated(files, automator)
 
         if not files:
             console.print(
-                "[bold yellow]⚠️  All downloadable files were ignored.[/bold yellow]"
+                "[bold yellow]⚠️  No downloadable files found for this TeraBox link. Retrying...[/bold yellow]"
             )
-            return 1
+            if config.retry_delay > 0:
+                await asyncio.sleep(config.retry_delay)
+            continue
 
-    console.print(f"[bold green]✓ Found {len(files)} downloadable file(s)![/bold green]\n")
-    print_files_table(files)
+        if ignore:
+            filtered_files = [f for f in files if f.filename not in ignore]
+            ignored_count = len(files) - len(filtered_files)
+            if ignored_count > 0:
+                console.print(
+                    f"[bold yellow]ℹ️  Ignored {ignored_count} file(s) based on --ignore list.[/bold yellow]"
+                )
+            files = filtered_files
 
-    if dry_run:
-        console.print("\n[yellow](--dry-run enabled: skipping file download)[/yellow]")
-        return 0
+            if not files:
+                if not is_truncated and not discovered_files:
+                    console.print(
+                        "[bold yellow]⚠️  All downloadable files were ignored.[/bold yellow]"
+                    )
+                    return 1
+                if config.retry_delay > 0:
+                    await asyncio.sleep(config.retry_delay)
+                continue
 
-    console.print(
-        f"\n[cyan]📥 Step 2: Downloading files (concurrency={config.concurrency}, max_retries={config.max_retries})...[/cyan]"
-    )
-    downloader = AsyncDownloader(config)
-    results = await downloader.download_all(files)
+        for f in files:
+            safe_name = sanitize_filename(f.filename)
+            name_key = f"name:{safe_name}"
+            key = _file_identity(f)
+            if f.fs_id and name_key in discovered_files and key not in discovered_files:
+                discovered_files.pop(name_key, None)
+                if name_key in completed_results and key not in completed_results:
+                    completed_results[key] = completed_results.pop(name_key)
+            elif not f.fs_id:
+                for existing_key, existing_file in list(discovered_files.items()):
+                    if sanitize_filename(existing_file.filename) == safe_name:
+                        key = existing_key
+                        break
+            discovered_files[key] = f
 
-    console.print("\n[bold]Download summary:[/bold]")
-    print_results_table(results)
+        if dry_run:
+            if is_truncated:
+                console.print(
+                    f"[bold yellow]⚠️  Found {len(files)} file(s), but listing is incomplete/truncated. Retrying extraction...[/bold yellow]"
+                )
+                if config.retry_delay > 0:
+                    await asyncio.sleep(config.retry_delay)
+                continue
+            all_discovered = list(discovered_files.values())
+            console.print(
+                f"[bold green]✓ Found {len(all_discovered)} downloadable file(s)![/bold green]\n"
+            )
+            print_files_table(all_discovered)
+            console.print("\n[yellow](--dry-run enabled: skipping file download)[/yellow]")
+            return 0
 
-    success_count = sum(1 for r in results if r.status == DownloadStatus.COMPLETED)
-    fail_count = len(results) - success_count
+        if is_truncated:
+            pending_map: Dict[str, FileInfo] = {}
+            for f in files:
+                if not _is_completed(f):
+                    key = _file_identity(f)
+                    pending_map[key] = discovered_files.get(key, f)
+            pending_files = list(pending_map.values())
+        else:
+            pending_files = [
+                f for f in discovered_files.values() if not _is_completed(f)
+            ]
 
-    if fail_count == 0:
-        console.print(
-            f"\n[bold green]🎉 All {success_count} file(s) successfully downloaded to '{config.output_dir}'![/bold green]"
+        console.print(f"[bold green]✓ Found {len(files)} downloadable file(s)![/bold green]\n")
+        print_files_table(files)
+
+        cycle_failed = False
+        if pending_files:
+            console.print(
+                f"\n[cyan]📥 Step 2: Downloading files (concurrency={config.concurrency}, max_retries={config.max_retries})...[/cyan]"
+            )
+            if downloader is None:
+                downloader = AsyncDownloader(config)
+            cycle_results = await downloader.download_all(pending_files)
+            for r in cycle_results:
+                key = _file_identity(r.file_info)
+                if r.status == DownloadStatus.COMPLETED:
+                    completed_results[key] = r
+                    completed_filenames.add(sanitize_filename(r.file_info.filename))
+                else:
+                    cycle_failed = True
+
+        all_discovered_completed = bool(discovered_files) and all(
+            _is_completed(f) for f in discovered_files.values()
         )
-        return 0
-    else:
-        console.print(
-            f"\n[bold red]⚠️  {fail_count} file(s) failed to download. Please check the error logs above.[/bold red]"
-        )
-        return 1
+
+        if not is_truncated and not cycle_failed and all_discovered_completed:
+            final_results: List[DownloadResult] = []
+            for key, f in discovered_files.items():
+                res = completed_results.get(key) or completed_results.get(
+                    f"name:{sanitize_filename(f.filename)}"
+                )
+                if res is not None:
+                    final_results.append(res)
+            console.print("\n[bold]Download summary:[/bold]")
+            print_results_table(final_results)
+            console.print(
+                f"\n[bold green]🎉 All {len(final_results)} file(s) successfully downloaded to '{config.output_dir}'![/bold green]"
+            )
+            return 0
+
+        if cycle_failed:
+            console.print(
+                "\n[bold yellow]⚠️  Some file(s) failed to download. Re-running extraction to obtain fresh links...[/bold yellow]"
+            )
+        elif is_truncated:
+            console.print(
+                "\n[bold yellow]⚠️  File listing was truncated. Re-running extraction to fetch remaining files...[/bold yellow]"
+            )
+
+        if config.retry_delay > 0:
+            await asyncio.sleep(config.retry_delay)
 
 
 @app.command()

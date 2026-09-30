@@ -50,8 +50,8 @@ class AsyncDownloader:
         if os.path.exists(target_path) and os.path.getsize(target_path) > 0:
             existing_target_size = os.path.getsize(target_path)
             if (
-                file_info.size_bytes > 0
-                and existing_target_size == file_info.size_bytes
+                (file_info.size_bytes > 0 and existing_target_size == file_info.size_bytes)
+                or (file_info.size_bytes == 0 and not os.path.exists(part_path))
             ):
                 if progress and task_id is not None:
                     progress.update(

@@ -2,7 +2,15 @@
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, Optional
+from typing import Dict, Iterable, Optional
+
+
+class CloudflareBlockError(RuntimeError):
+    """Raised when extraction is blocked by Cloudflare bot detection or Turnstile."""
+
+
+class SandboxPolicyError(RuntimeError):
+    """Raised when refusing to launch Chrome as root without --i-accept-no-sandbox."""
 
 
 class DownloadStatus(Enum):
@@ -35,6 +43,44 @@ class FileInfo:
             }
 
 
+class ExtractedFileList(list):
+    """A list of FileInfo objects carrying listing completeness metadata."""
+
+    def __init__(
+        self,
+        iterable: Iterable[FileInfo] = (),
+        *,
+        truncated: bool = False,
+        reason: Optional[str] = None,
+        truncation_reason: Optional[str] = None,
+    ):
+        super().__init__(iterable)
+        self.truncated: bool = bool(truncated)
+        self._reason: Optional[str] = (
+            reason if reason is not None else truncation_reason
+        )
+
+    @property
+    def reason(self) -> Optional[str]:
+        return self._reason
+
+    @reason.setter
+    def reason(self, value: Optional[str]) -> None:
+        self._reason = value
+
+    @property
+    def truncation_reason(self) -> Optional[str]:
+        return self._reason
+
+    @truncation_reason.setter
+    def truncation_reason(self, value: Optional[str]) -> None:
+        self._reason = value
+
+
+FileList = ExtractedFileList
+FileListing = ExtractedFileList
+
+
 @dataclass
 class DownloadResult:
     """Outcome of attempting to download a FileInfo."""
@@ -64,3 +110,7 @@ class DownloadConfig:
     # running as root, where Chrome cannot enable the sandbox at all. Off by
     # default: see terabox_dl.automator.should_disable_sandbox.
     allow_no_sandbox: bool = False
+    challenge_timeout_attempts: int = 30
+    challenge_poll_interval: float = 1.0
+    challenge_max_clicks: int = 3
+    challenge_click_cooldown_attempts: int = 4
