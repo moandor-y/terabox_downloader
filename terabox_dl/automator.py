@@ -394,6 +394,155 @@ _LISTING_SCRIPT_TEMPLATE = """
     const DELAY_MS = __DELAY_MS__;
     const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+    const hasValidPass = () => {
+        try {
+            if (typeof document === 'undefined' || !document.cookie) return false;
+            const m = document.cookie.match(/(?:^|;\\s*)tdl_pass_exp=(\\d+)/);
+            if (!m) return false;
+            return Number(m[1]) - Date.now() / 1000 > 60;
+        } catch (e) {
+            return false;
+        }
+    };
+
+    const getTurnstileState = () => {
+        try {
+            if (typeof document === 'undefined') return { active: false, interactive: false, rect: null };
+            const inp = document.querySelector('input[name="cf-turnstile-response"]');
+            if (!inp) return { active: false, interactive: false, rect: null };
+            const target = inp.parentElement || inp;
+            const r = target.getBoundingClientRect ? target.getBoundingClientRect() : null;
+            const rect = (r && r.width > 0 && r.height > 0)
+                ? { x: r.x, y: r.y, width: r.width, height: r.height }
+                : null;
+            let interactive = false;
+            let foundFixedOverlay = false;
+            let el = inp.parentElement;
+            while (el && el !== document.body) {
+                const st = el.style;
+                if (st && (st.zIndex === '2147483647' || st.position === 'fixed')) {
+                    foundFixedOverlay = true;
+                    interactive = st.opacity === '1' || st.pointerEvents === 'auto';
+                    break;
+                }
+                el = el.parentElement;
+            }
+            if (!foundFixedOverlay && rect) {
+                interactive = true;
+            }
+            return { active: true, interactive: interactive, rect: rect };
+        } catch (e) {
+            return { active: false, interactive: false, rect: null };
+        }
+    };
+
+    const startTurnstileWidget = () => {
+        try {
+            if (typeof window === 'undefined' || typeof document === 'undefined') return;
+            try {
+                window.dispatchEvent(new Event('pointerdown'));
+                window.dispatchEvent(new Event('focusin'));
+            } catch (e) {}
+            if (document.querySelector('input[name="cf-turnstile-response"]')) return;
+            const renderWidget = () => {
+                if (!window.turnstile || document.querySelector('input[name="cf-turnstile-response"]')) return;
+                const overlay = document.createElement('div');
+                overlay.style.cssText = 'position:fixed;inset:0;z-index:2147483647;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.45);opacity:0;pointer-events:none;transition:opacity .15s';
+                const box = document.createElement('div');
+                overlay.appendChild(box);
+                document.body.appendChild(overlay);
+                let widgetId;
+                const cleanup = () => {
+                    if (widgetId !== undefined) {
+                        try { window.turnstile.remove(widgetId); } catch (e) {}
+                    }
+                    overlay.remove();
+                };
+                widgetId = window.turnstile.render(box, {
+                    sitekey: '0x4AAAAAAFZHusiSezRUKq4-',
+                    appearance: 'interaction-only',
+                    callback: async (token) => {
+                        try {
+                            await fetch('/api/verify', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ token: token })
+                            });
+                        } catch (e) {
+                        } finally {
+                            cleanup();
+                        }
+                    },
+                    'error-callback': () => cleanup(),
+                    'timeout-callback': () => cleanup(),
+                    'before-interactive-callback': () => {
+                        overlay.style.opacity = '1';
+                        overlay.style.pointerEvents = 'auto';
+                    },
+                    'after-interactive-callback': () => {
+                        overlay.style.opacity = '0';
+                        overlay.style.pointerEvents = 'none';
+                    }
+                });
+            };
+            if (window.turnstile) {
+                renderWidget();
+            } else if (!document.querySelector('script[src*="challenges.cloudflare.com/turnstile"]')) {
+                const s = document.createElement('script');
+                s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+                s.async = true;
+                s.onload = () => renderWidget();
+                document.head.appendChild(s);
+            }
+        } catch (e) {}
+    };
+
+    const ensurePass = async (force) => {
+        if (!force && hasValidPass()) return { ok: true };
+        if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+            try {
+                window.dispatchEvent(new Event('pointerdown'));
+                window.dispatchEvent(new Event('focusin'));
+            } catch (e) {}
+        }
+        const pollMs = Math.max(50, Math.min(200, DELAY_MS || 150));
+        const maxPolls = 30;
+        let startedFallback = false;
+        for (let i = 0; i < maxPolls; i++) {
+            if (hasValidPass()) return { ok: true };
+            const ts = getTurnstileState();
+            if (ts.interactive && ts.rect) {
+                await sleep(Math.min(600, pollMs * 4));
+                if (hasValidPass()) return { ok: true };
+                const tsAfter = getTurnstileState();
+                return {
+                    ok: false,
+                    challenge_required: true,
+                    turnstile_rect: (tsAfter && tsAfter.rect) || ts.rect
+                };
+            }
+            if (!ts.active && (force || i >= 5) && !startedFallback) {
+                startedFallback = true;
+                startTurnstileWidget();
+            }
+            await sleep(pollMs);
+        }
+        if (hasValidPass()) return { ok: true };
+        const finalTs = getTurnstileState();
+        return {
+            ok: false,
+            challenge_required: true,
+            turnstile_rect: finalTs.rect || null
+        };
+    };
+
+    if (!hasValidPass() && typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+        try {
+            window.dispatchEvent(new Event('pointerdown'));
+            window.dispatchEvent(new Event('focusin'));
+        } catch (e) {}
+    }
+
     const batches = [];
     const seenItems = new Set();
     // '' is the share root; nested folder paths are appended as they are found.
@@ -404,12 +553,18 @@ _LISTING_SCRIPT_TEMPLATE = """
     let pagesFetched = 0;
     let truncated = false;
     let reason = '';
+    let challengeRequired = false;
+    let turnstileRect = null;
 
     const fetchPage = async (dir, page) => {
         let lastError = '';
+        let challengeAttempts = 0;
         for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
             try {
                 const payload = { url: teraboxUrl, page: page };
+                if (dir) {
+                    payload.dir = dir;
+                }
                 if (shareId && uk) {
                     payload.share_id = shareId;
                     payload.uk = uk;
@@ -424,6 +579,32 @@ _LISTING_SCRIPT_TEMPLATE = """
                     return { data: await r.json() };
                 }
                 lastError = 'HTTP ' + r.status;
+                if (r.status === 403) {
+                    let needChallenge = Boolean(
+                        r.headers && typeof r.headers.get === 'function' && r.headers.get('x-challenge-required')
+                    ) || !hasValidPass();
+                    if (!needChallenge && typeof r.clone === 'function') {
+                        try {
+                            const errBody = await r.clone().json();
+                            if (errBody && (errBody.code === 'CHALLENGE_REQUIRED' || /verification|challenge/i.test(String(errBody.error || '')))) {
+                                needChallenge = true;
+                            }
+                        } catch (e) {}
+                    }
+                    if (needChallenge && challengeAttempts < 2) {
+                        challengeAttempts++;
+                        const passRes = await ensurePass(challengeAttempts > 1);
+                        if (passRes.ok) {
+                            attempt--;
+                            continue;
+                        }
+                        return {
+                            error: lastError,
+                            challenge_required: true,
+                            turnstile_rect: passRes.turnstile_rect || null
+                        };
+                    }
+                }
                 // Client errors other than rate limiting will not succeed on retry.
                 if (r.status >= 400 && r.status < 500 && r.status !== 429) {
                     return { error: lastError };
@@ -454,6 +635,10 @@ _LISTING_SCRIPT_TEMPLATE = """
             if (result.error) {
                 truncated = true;
                 reason = 'request for page ' + page + dirLabel + ' failed: ' + result.error;
+                if (result.challenge_required) {
+                    challengeRequired = true;
+                    turnstileRect = result.turnstile_rect || null;
+                }
                 break walk;
             }
 
@@ -506,7 +691,12 @@ _LISTING_SCRIPT_TEMPLATE = """
                 break;
             }
 
-            if (page === 1) pageSize = list.length;
+            const declaredPageSize = Number(data.page_size);
+            if (Number.isFinite(declaredPageSize) && declaredPageSize > 0) {
+                pageSize = declaredPageSize;
+            } else if (page === 1) {
+                pageSize = list.length;
+            }
             const fullPage = pageSize > 0 && list.length >= pageSize;
             const rawHasMore = data.has_more;
             const hasMoreKnown = rawHasMore !== undefined && rawHasMore !== null;
@@ -528,10 +718,93 @@ _LISTING_SCRIPT_TEMPLATE = """
         pages: pagesFetched,
         folders: knownDirs.size - 1,
         truncated: truncated,
-        reason: reason
+        reason: reason,
+        challenge_required: challengeRequired,
+        turnstile_rect: turnstileRect
     });
 })()
 """
+
+_TURNSTILE_POLL_SCRIPT = """
+(() => {
+    try {
+        const m = document.cookie ? document.cookie.match(/(?:^|;\\s*)tdl_pass_exp=(\\d+)/) : null;
+        const passValid = m ? (Number(m[1]) - Date.now() / 1000 > 60) : false;
+        if (passValid) {
+            return JSON.stringify({ passValid: true, active: false, rect: null });
+        }
+        const inp = document.querySelector('input[name="cf-turnstile-response"]');
+        if (inp) {
+            const target = inp.parentElement || inp;
+            const r = target.getBoundingClientRect ? target.getBoundingClientRect() : null;
+            const rect = (r && r.width > 0 && r.height > 0)
+                ? { x: r.x, y: r.y, width: r.width, height: r.height }
+                : null;
+            return JSON.stringify({ passValid: false, active: true, rect: rect });
+        }
+        try {
+            window.dispatchEvent(new Event('pointerdown'));
+            window.dispatchEvent(new Event('focusin'));
+        } catch (e) {}
+        if (window.turnstile && !document.querySelector('input[name="cf-turnstile-response"]')) {
+            const overlay = document.createElement('div');
+            overlay.style.cssText = 'position:fixed;inset:0;z-index:2147483647;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.45);opacity:0;pointer-events:none;transition:opacity .15s';
+            const box = document.createElement('div');
+            overlay.appendChild(box);
+            document.body.appendChild(overlay);
+            let widgetId;
+            const cleanup = () => {
+                if (widgetId !== undefined) {
+                    try { window.turnstile.remove(widgetId); } catch (e) {}
+                }
+                overlay.remove();
+            };
+            widgetId = window.turnstile.render(box, {
+                sitekey: '0x4AAAAAAFZHusiSezRUKq4-',
+                appearance: 'interaction-only',
+                callback: async (token) => {
+                    try {
+                        await fetch('/api/verify', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ token: token })
+                        });
+                    } catch (e) {
+                    } finally {
+                        cleanup();
+                    }
+                },
+                'error-callback': () => cleanup(),
+                'timeout-callback': () => cleanup(),
+                'before-interactive-callback': () => {
+                    overlay.style.opacity = '1';
+                    overlay.style.pointerEvents = 'auto';
+                },
+                'after-interactive-callback': () => {
+                    overlay.style.opacity = '0';
+                    overlay.style.pointerEvents = 'none';
+                }
+            });
+        }
+        return JSON.stringify({ passValid: false, active: false, rect: null });
+    } catch (e) {
+        return JSON.stringify({ passValid: false, active: false, rect: null });
+    }
+})()
+"""
+
+
+def _parse_challenge_required(raw_result: Any) -> Optional[Dict[str, Any]]:
+    """Return parsed dict if the listing script output indicates an unresolved Turnstile challenge."""
+    if not isinstance(raw_result, str):
+        return None
+    try:
+        data = json.loads(raw_result)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if isinstance(data, dict) and data.get("challenge_required"):
+        return data
+    return None
 
 
 def build_listing_script(terabox_url: str) -> str:
@@ -667,6 +940,190 @@ class TeraBoxAutomator:
                         raise CloudflareBlockError(str(pw_exc)) from pw_exc
                     raise
 
+    async def _resolve_inpage_turnstile_nodriver(
+        self,
+        page: Any,
+        uc: Any,
+        initial_result: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Click and wait for in-page Cloudflare Turnstile (/api/verify) using nodriver CDP."""
+        attempts = max(1, int(self.config.challenge_timeout_attempts))
+        poll_interval = max(0.0, float(self.config.challenge_poll_interval))
+        max_clicks = max(1, int(self.config.challenge_max_clicks))
+        cooldown_attempts = max(1, int(self.config.challenge_click_cooldown_attempts))
+        challenge_clicks = 0
+        last_click_attempt: Optional[int] = None
+        initial_rect = (
+            initial_result.get("turnstile_rect")
+            if isinstance(initial_result, dict)
+            else None
+        )
+
+        for attempt_idx in range(attempts):
+            state: Dict[str, Any] = {}
+            try:
+                raw_state = await page.evaluate(_TURNSTILE_POLL_SCRIPT)
+                if isinstance(raw_state, str):
+                    parsed_state = json.loads(raw_state)
+                    if isinstance(parsed_state, dict):
+                        state = parsed_state
+            except Exception:
+                state = {}
+
+            if state.get("passValid"):
+                return
+
+            rect = state.get("rect")
+            if (
+                attempt_idx == 0
+                and not isinstance(rect, dict)
+                and isinstance(initial_rect, dict)
+            ):
+                rect = initial_rect
+
+            if (
+                challenge_clicks >= max_clicks
+                and last_click_attempt is not None
+                and (attempt_idx - last_click_attempt) >= cooldown_attempts
+            ):
+                raise CloudflareBlockError(
+                    f"Blocked by Cloudflare bot detection: Turnstile challenge repeated after {challenge_clicks} click attempts."
+                )
+
+            if (
+                isinstance(rect, dict)
+                and float(rect.get("width", 0)) > 0
+                and float(rect.get("height", 0)) > 0
+            ):
+                if challenge_clicks < max_clicks and (
+                    last_click_attempt is None
+                    or (attempt_idx - last_click_attempt) >= cooldown_attempts
+                ):
+                    try:
+                        width = float(rect["width"])
+                        height = float(rect["height"])
+                        offset_x = (
+                            min(28.0, width / 2.0) if width >= 60.0 else width / 2.0
+                        )
+                        click_x = float(rect["x"]) + offset_x
+                        click_y = float(rect["y"]) + height / 2.0
+                        try:
+                            await page.send(
+                                uc.cdp.input_.dispatch_mouse_event(
+                                    "mouseMoved", x=click_x, y=click_y
+                                )
+                            )
+                        except Exception:
+                            pass
+                        await page.send(
+                            uc.cdp.input_.dispatch_mouse_event(
+                                "mousePressed",
+                                x=click_x,
+                                y=click_y,
+                                button=uc.cdp.input_.MouseButton("left"),
+                                click_count=1,
+                            )
+                        )
+                        await page.send(
+                            uc.cdp.input_.dispatch_mouse_event(
+                                "mouseReleased",
+                                x=click_x,
+                                y=click_y,
+                                button=uc.cdp.input_.MouseButton("left"),
+                                click_count=1,
+                            )
+                        )
+                        challenge_clicks += 1
+                        last_click_attempt = attempt_idx
+                    except Exception:
+                        pass
+
+            await asyncio.sleep(poll_interval)
+
+        raise CloudflareBlockError(
+            f"Blocked by Cloudflare bot detection: Turnstile verification timed out after {challenge_clicks} click attempts."
+        )
+
+    async def _resolve_inpage_turnstile_playwright(
+        self,
+        page: Any,
+        initial_result: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Click and wait for in-page Cloudflare Turnstile (/api/verify) using Playwright."""
+        attempts = max(1, int(self.config.challenge_timeout_attempts))
+        poll_interval = max(0.0, float(self.config.challenge_poll_interval))
+        max_clicks = max(1, int(self.config.challenge_max_clicks))
+        cooldown_attempts = max(1, int(self.config.challenge_click_cooldown_attempts))
+        challenge_clicks = 0
+        last_click_attempt: Optional[int] = None
+        initial_rect = (
+            initial_result.get("turnstile_rect")
+            if isinstance(initial_result, dict)
+            else None
+        )
+
+        for attempt_idx in range(attempts):
+            state: Dict[str, Any] = {}
+            try:
+                raw_state = await page.evaluate(_TURNSTILE_POLL_SCRIPT)
+                if isinstance(raw_state, str):
+                    parsed_state = json.loads(raw_state)
+                    if isinstance(parsed_state, dict):
+                        state = parsed_state
+            except Exception:
+                state = {}
+
+            if state.get("passValid"):
+                return
+
+            rect = state.get("rect")
+            if (
+                attempt_idx == 0
+                and not isinstance(rect, dict)
+                and isinstance(initial_rect, dict)
+            ):
+                rect = initial_rect
+
+            if (
+                challenge_clicks >= max_clicks
+                and last_click_attempt is not None
+                and (attempt_idx - last_click_attempt) >= cooldown_attempts
+            ):
+                raise CloudflareBlockError(
+                    f"Blocked by Cloudflare bot detection: Turnstile challenge repeated after {challenge_clicks} click attempts."
+                )
+
+            if (
+                isinstance(rect, dict)
+                and float(rect.get("width", 0)) > 0
+                and float(rect.get("height", 0)) > 0
+            ):
+                if challenge_clicks < max_clicks and (
+                    last_click_attempt is None
+                    or (attempt_idx - last_click_attempt) >= cooldown_attempts
+                ):
+                    try:
+                        width = float(rect["width"])
+                        height = float(rect["height"])
+                        offset_x = (
+                            min(28.0, width / 2.0) if width >= 60.0 else width / 2.0
+                        )
+                        click_x = float(rect["x"]) + offset_x
+                        click_y = float(rect["y"]) + height / 2.0
+                        if hasattr(page, "mouse") and hasattr(page.mouse, "move"):
+                            await page.mouse.move(click_x, click_y, steps=5)
+                        await page.mouse.click(click_x, click_y)
+                        challenge_clicks += 1
+                        last_click_attempt = attempt_idx
+                    except Exception:
+                        pass
+
+            await asyncio.sleep(poll_interval)
+
+        raise CloudflareBlockError(
+            f"Blocked by Cloudflare bot detection: Turnstile verification timed out after {challenge_clicks} click attempts."
+        )
+
     async def _extract_files_nodriver(self, terabox_url: str) -> ExtractedFileList:
         """Extract files using nodriver (pure Python CDP automation)."""
         import nodriver as uc
@@ -675,6 +1132,7 @@ class TeraBoxAutomator:
         captured_files: ExtractedFileList = ExtractedFileList()
         api_error_message: Optional[str] = None
         pending_api_requests: Dict[str, str] = {}
+        ui_listing_has_more: bool = False
 
         try:
             start_kwargs = {
@@ -773,11 +1231,11 @@ class TeraBoxAutomator:
 
             async def on_response(event: uc.cdp.network.ResponseReceived):
                 url = event.response.url
-                if "proxy" in url or "teradl.com/api" in url:
+                if ("proxy" in url or "teradl.com/api" in url) and "/api/verify" not in url:
                     pending_api_requests[event.request_id] = url
 
             async def on_loading_finished(event: uc.cdp.network.LoadingFinished):
-                nonlocal api_error_message
+                nonlocal api_error_message, ui_listing_has_more
                 if event.request_id in pending_api_requests:
                     url = pending_api_requests.pop(event.request_id)
                     logger.debug("Intercepted finished TeraBox API call: %s", url)
@@ -788,6 +1246,13 @@ class TeraBoxAutomator:
                         body_text = res[0]
                         if body_text:
                             data = json.loads(body_text)
+                            if isinstance(data, dict) and data.get("has_more") not in (
+                                None,
+                                False,
+                                0,
+                                "0",
+                            ):
+                                ui_listing_has_more = True
                             try:
                                 parsed = parse_proxy_json(data)
                                 captured_files.extend(parsed)
@@ -805,14 +1270,39 @@ class TeraBoxAutomator:
                 fetch_res_raw = await page.evaluate(
                     build_listing_script(terabox_url), await_promise=True
                 )
-                api_error_message = (
-                    consume_listing_result(fetch_res_raw, captured_files) or api_error_message
-                )
+                challenge_info = _parse_challenge_required(fetch_res_raw)
+                if challenge_info is not None:
+                    for batch in challenge_info.get("batches") or []:
+                        try:
+                            captured_files.extend(parse_proxy_json(batch))
+                        except RuntimeError as err:
+                            api_error_message = str(err)
+                            break
+                    if not api_error_message:
+                        await self._resolve_inpage_turnstile_nodriver(
+                            page, uc, initial_result=challenge_info
+                        )
+                        fetch_res_raw = await page.evaluate(
+                            build_listing_script(terabox_url), await_promise=True
+                        )
+                        if _parse_challenge_required(fetch_res_raw) is not None:
+                            raise CloudflareBlockError(
+                                "Blocked by Cloudflare bot detection: Turnstile verification challenge persisted."
+                            )
+                if not api_error_message:
+                    api_error_message = (
+                        consume_listing_result(fetch_res_raw, captured_files)
+                        or api_error_message
+                    )
+            except CloudflareBlockError:
+                raise
             except Exception as e:
                 logger.debug("Direct in-page fetch fallback: %s", e)
 
             # If not captured via direct fetch, fall back to UI form submission
             if not captured_files and not api_error_message:
+                captured_files.truncated = False
+                captured_files.reason = None
                 # Block popunder/popup ads and clean ad overlay backdrops
                 cleanup_script = """
                 (() => {
@@ -900,6 +1390,19 @@ class TeraBoxAutomator:
                     if captured_files or api_error_message:
                         break
 
+                if captured_files and ui_listing_has_more and not api_error_message:
+                    try:
+                        fetch_res_raw = await page.evaluate(
+                            build_listing_script(terabox_url), await_promise=True
+                        )
+                        api_error_message = (
+                            consume_listing_result(fetch_res_raw, captured_files)
+                            or api_error_message
+                        )
+                    except Exception:
+                        captured_files.truncated = True
+                        captured_files.reason = "UI fallback fetched only page 1"
+
             if api_error_message:
                 if is_cloudflare_error(RuntimeError(api_error_message)) or is_cloudflare_html(
                     api_error_message
@@ -966,6 +1469,7 @@ class TeraBoxAutomator:
 
         captured_files: ExtractedFileList = ExtractedFileList()
         api_error_message: Optional[str] = None
+        ui_listing_has_more: bool = False
 
         async with async_playwright() as p:
             args = [
@@ -1008,12 +1512,18 @@ class TeraBoxAutomator:
                 await _apply_stealth(page)
 
                 async def handle_response(response):
-                    nonlocal api_error_message
-                    if "proxy" in response.url or "teradl.com/api" in response.url:
+                    nonlocal api_error_message, ui_listing_has_more
+                    if (
+                        "proxy" in response.url or "teradl.com/api" in response.url
+                    ) and "/api/verify" not in response.url:
                         try:
                             text = await response.text()
                             if text:
                                 data = json.loads(text)
+                                if isinstance(data, dict) and data.get(
+                                    "has_more"
+                                ) not in (None, False, 0, "0"):
+                                    ui_listing_has_more = True
                                 try:
                                     parsed = parse_proxy_json(data)
                                     captured_files.extend(parsed)
@@ -1175,14 +1685,39 @@ class TeraBoxAutomator:
                 # Direct In-Page Multi-Page Extraction (100% immune to UI ad blockers, overlays, modals, and popunders)
                 try:
                     fetch_res_raw = await page.evaluate(build_listing_script(terabox_url))
-                    api_error_message = (
-                        consume_listing_result(fetch_res_raw, captured_files) or api_error_message
-                    )
+                    challenge_info = _parse_challenge_required(fetch_res_raw)
+                    if challenge_info is not None:
+                        for batch in challenge_info.get("batches") or []:
+                            try:
+                                captured_files.extend(parse_proxy_json(batch))
+                            except RuntimeError as err:
+                                api_error_message = str(err)
+                                break
+                        if not api_error_message:
+                            await self._resolve_inpage_turnstile_playwright(
+                                page, initial_result=challenge_info
+                            )
+                            fetch_res_raw = await page.evaluate(
+                                build_listing_script(terabox_url)
+                            )
+                            if _parse_challenge_required(fetch_res_raw) is not None:
+                                raise CloudflareBlockError(
+                                    "Blocked by Cloudflare bot detection: Turnstile verification challenge persisted."
+                                )
+                    if not api_error_message:
+                        api_error_message = (
+                            consume_listing_result(fetch_res_raw, captured_files)
+                            or api_error_message
+                        )
+                except CloudflareBlockError:
+                    raise
                 except Exception as e:
                     logger.debug("Playwright in-page fetch fallback: %s", e)
 
                 # If not captured via direct fetch, fall back to UI form submission
                 if not captured_files and not api_error_message:
+                    captured_files.truncated = False
+                    captured_files.reason = None
                     # Block popunder/popup ads and clean ad overlay backdrops
                     cleanup_script = """
                     (() => {
@@ -1267,6 +1802,19 @@ class TeraBoxAutomator:
                         await asyncio.sleep(poll_interval)
                         if captured_files or api_error_message:
                             break
+
+                    if captured_files and ui_listing_has_more and not api_error_message:
+                        try:
+                            fetch_res_raw = await page.evaluate(
+                                build_listing_script(terabox_url)
+                            )
+                            api_error_message = (
+                                consume_listing_result(fetch_res_raw, captured_files)
+                                or api_error_message
+                            )
+                        except Exception:
+                            captured_files.truncated = True
+                            captured_files.reason = "UI fallback fetched only page 1"
 
                 if api_error_message:
                     if is_cloudflare_error(RuntimeError(api_error_message)) or is_cloudflare_html(

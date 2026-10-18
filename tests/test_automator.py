@@ -658,3 +658,147 @@ async def test_extract_files_playwright_turnstile_click_resolves_after_cooldown(
     assert fake_page.mouse.click.await_count == 1
     fake_page.mouse.click.assert_called_once_with(78.0, 132.5)
 
+
+@pytest.mark.asyncio
+async def test_extract_files_nodriver_inpage_turnstile_resolves_and_fetches_all_pages(
+    monkeypatch,
+):
+    from unittest.mock import AsyncMock, MagicMock
+
+    monkeypatch.setattr(automator.os, "geteuid", lambda: 1000, raising=False)
+
+    eval_responses = [
+        "Terabox Downloader",
+        json.dumps(
+            {
+                "batches": [],
+                "pages": 0,
+                "folders": 0,
+                "truncated": True,
+                "reason": "request for page 1 failed: HTTP 403",
+                "challenge_required": True,
+                "turnstile_rect": {"x": 800.0, "y": 430.0, "width": 300.0, "height": 72.0},
+            }
+        ),
+        json.dumps(
+            {
+                "passValid": False,
+                "active": True,
+                "rect": {"x": 800.0, "y": 430.0, "width": 300.0, "height": 72.0},
+            }
+        ),
+        json.dumps({"passValid": True, "active": False, "rect": None}),
+        json.dumps(
+            {
+                "batches": [_batch(0, 20), _batch(20, 5)],
+                "pages": 2,
+                "folders": 0,
+                "truncated": False,
+                "reason": "",
+            }
+        ),
+    ]
+
+    fake_page = MagicMock()
+    fake_page.evaluate = AsyncMock(side_effect=lambda *a, **kw: eval_responses.pop(0))
+    fake_page.send = AsyncMock()
+    fake_page.add_handler = MagicMock()
+
+    fake_browser = MagicMock()
+    fake_browser.get = AsyncMock(return_value=fake_page)
+    fake_browser.aclose = AsyncMock()
+    fake_browser.stop = MagicMock()
+
+    import nodriver as uc
+
+    monkeypatch.setattr(uc, "start", AsyncMock(return_value=fake_browser))
+
+    config = DownloadConfig(
+        browser_engine="nodriver",
+        challenge_timeout_attempts=5,
+        challenge_poll_interval=0.0,
+    )
+    auto = TeraBoxAutomator(config)
+    files = await auto.extract_files("https://terabox.com/s/1abc")
+
+    assert len(files) == 25
+    assert files.truncated is False
+    assert auto.last_listing_truncated is False
+
+
+@pytest.mark.asyncio
+async def test_extract_files_playwright_inpage_turnstile_repeating_raises(monkeypatch):
+    from unittest.mock import AsyncMock, MagicMock
+
+    monkeypatch.setattr(automator.os, "geteuid", lambda: 1000, raising=False)
+
+    rect = {"x": 800.0, "y": 430.0, "width": 300.0, "height": 72.0}
+    first_listing = json.dumps(
+        {
+            "batches": [],
+            "pages": 0,
+            "folders": 0,
+            "truncated": True,
+            "reason": "request for page 1 failed: HTTP 403",
+            "challenge_required": True,
+            "turnstile_rect": rect,
+        }
+    )
+    poll_state = json.dumps({"passValid": False, "active": True, "rect": rect})
+    eval_calls = [0]
+
+    async def _fake_eval(script, *args, **kwargs):
+        eval_calls[0] += 1
+        if eval_calls[0] == 1:
+            return first_listing
+        return poll_state
+
+    fake_page = MagicMock()
+    fake_page.on = MagicMock()
+    fake_page.goto = AsyncMock()
+    fake_page.title = AsyncMock(return_value="Terabox Downloader")
+    fake_page.wait_for_selector = AsyncMock(return_value=MagicMock())
+    fake_page.mouse = MagicMock()
+    fake_page.mouse.move = AsyncMock()
+    fake_page.mouse.click = AsyncMock()
+    fake_page.evaluate = AsyncMock(side_effect=_fake_eval)
+
+    fake_context = MagicMock()
+    fake_context.new_page = AsyncMock(return_value=fake_page)
+
+    fake_browser = MagicMock()
+    fake_browser.new_context = AsyncMock(return_value=fake_context)
+    fake_browser.close = AsyncMock()
+
+    fake_pw = MagicMock()
+    fake_pw.chromium.launch = AsyncMock(return_value=fake_browser)
+
+    fake_pw_cm = MagicMock()
+    fake_pw_cm.__aenter__ = AsyncMock(return_value=fake_pw)
+    fake_pw_cm.__aexit__ = AsyncMock(return_value=False)
+
+    import playwright.async_api
+    import playwright_stealth
+
+    monkeypatch.setattr(playwright.async_api, "async_playwright", lambda: fake_pw_cm)
+    if hasattr(playwright_stealth, "Stealth"):
+        monkeypatch.setattr(
+            playwright_stealth.Stealth, "apply_stealth_async", AsyncMock()
+        )
+
+    config = DownloadConfig(
+        browser_engine="playwright",
+        challenge_timeout_attempts=20,
+        challenge_poll_interval=0.0,
+        challenge_max_clicks=2,
+        challenge_click_cooldown_attempts=3,
+    )
+    with pytest.raises(
+        automator.CloudflareBlockError,
+        match="Turnstile challenge repeated after 2 click attempts",
+    ):
+        await TeraBoxAutomator(config).extract_files("https://terabox.com/s/1abc")
+
+    assert fake_page.mouse.click.await_count == 2
+    fake_page.mouse.click.assert_called_with(828.0, 466.0)
+
